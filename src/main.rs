@@ -4,6 +4,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod parser;
+
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
 const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd"];
@@ -57,24 +59,42 @@ fn main() {
             continue;
         }
 
-        // 5. 拆分命令和参数
-        let mut parts = line.split_whitespace();
-        let cmd = match parts.next() {
-            Some(c) => c,
-            None => continue,
+        // 5. 词法分析：支持单引号的 token 切分
+        //    解析失败（如未闭合引号）打印错误后继续 REPL，不中断进程
+        let tokens = match parser::tokenize(line) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{}", e);
+                continue;
+            }
         };
+
+        // 空 token 序列 = 仅空白行，继续下一轮
+        if tokens.is_empty() {
+            continue;
+        }
+
+        // 拆分命令与参数；cmd 用 &str 便于 match，args 保留 &[String]
+        let cmd = tokens[0].as_str();
+        let args: &[String] = &tokens[1..];
+
+        // 极端情况：纯 `''` 这类输入会得到空字符串 cmd，按 not found 处理
+        if cmd.is_empty() {
+            println!("{}: command not found", line);
+            continue;
+        }
 
         // 6. 内建命令分发
         match cmd {
             "exit" => {
                 // 可选退出码，解析失败回退为 0
-                let code = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                let code = args.first().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 std::process::exit(code);
             }
             "echo" => {
                 // 将剩余参数用单空格连接后打印
-                let output = parts.collect::<Vec<&str>>().join(" ");
-                println!("{}", output);
+                // 引号内空格已在 token 内部保留，此处单空格 join 是正确行为
+                println!("{}", args.join(" "));
             }
             "pwd" => {
                 // 打印当前工作目录的绝对路径；忽略多余参数（与 POSIX 宽松行为一致）
@@ -89,7 +109,7 @@ fn main() {
                 // 取首个参数作为目标路径；支持绝对路径、相对路径（./、../、子目录名）与 ~
                 // 相对路径由内核基于当前进程 cwd 解析，无需在此做字符串展开
                 // 无参数场景本阶段不覆盖，静默跳过
-                if let Some(target) = parts.next() {
+                if let Some(target) = args.first() {
                     // ~ 展开：本阶段仅匹配精确 "~"，不处理 ~/subdir 或 ~user 形式
                     // HOME 缺失时按统一错误格式输出，避免 unwrap 导致 REPL 中断
                     let resolved = if target == "~" {
@@ -101,7 +121,7 @@ fn main() {
                             }
                         }
                     } else {
-                        target.to_string()
+                        target.clone()
                     };
                     // 直接调用 chdir(2)：失败时 OS 保证 cwd 不变，无 TOCTOU 风险
                     // 不存在 / 非目录 / 无权限等失败统一打印同一错误信息以匹配测试期望
@@ -113,7 +133,8 @@ fn main() {
             }
             "type" => {
                 // 取首个参数作为查询目标；无参时不输出，进入下一轮 REPL
-                if let Some(target) = parts.next() {
+                if let Some(target) = args.first() {
+                    let target = target.as_str();
                     if BUILTINS.contains(&target) {
                         println!("{} is a shell builtin", target);
                     } else if let Some(path) = find_in_path(target) {
@@ -128,7 +149,7 @@ fn main() {
                 if let Some(path) = find_in_path(cmd) {
                     // argv[0] 必须是用户输入的命令名而非完整路径（与 bash 行为一致）
                     // stdio 默认继承父进程，子程序输出会直接显示
-                    let status = Command::new(&path).arg0(cmd).args(parts).status();
+                    let status = Command::new(&path).arg0(cmd).args(args).status();
                     if status.is_err() {
                         // spawn / wait 失败时降级，避免 REPL 中断
                         println!("{}: command not found", line);
