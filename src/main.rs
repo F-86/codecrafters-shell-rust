@@ -43,6 +43,11 @@ fn main() {
                 let code = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                 std::process::exit(code);
             }
+            "echo" => {
+                // 将剩余参数用单空格连接后打印
+                let output = parts.collect::<Vec<&str>>().join(" ");
+                println!("{}", output);
+            }
             _ => {
                 println!("{}: command not found", line);
             }
