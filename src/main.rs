@@ -1,8 +1,30 @@
 use std::io::{self, BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
 const BUILTINS: &[&str] = &["echo", "exit", "type"];
+
+/// 按 PATH 顺序查找可执行文件。
+/// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
+/// 目录不存在 / 无权限读取 / 非普通文件等场景静默跳过，与 bash 实际行为一致。
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        let Ok(meta) = candidate.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.permissions().mode() & 0o111 != 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
 
 fn main() {
     let stdin = io::stdin();
@@ -57,6 +79,8 @@ fn main() {
                 if let Some(target) = parts.next() {
                     if BUILTINS.contains(&target) {
                         println!("{} is a shell builtin", target);
+                    } else if let Some(path) = find_in_path(target) {
+                        println!("{} is {}", target, path.display());
                     } else {
                         println!("{}: not found", target);
                     }
