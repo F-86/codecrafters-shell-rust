@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
@@ -87,7 +89,18 @@ fn main() {
                 }
             }
             _ => {
-                println!("{}: command not found", line);
+                // 非内建：复用 type 的 PATH 查找，命中即作为外部程序执行
+                if let Some(path) = find_in_path(cmd) {
+                    // argv[0] 必须是用户输入的命令名而非完整路径（与 bash 行为一致）
+                    // stdio 默认继承父进程，子程序输出会直接显示
+                    let status = Command::new(&path).arg0(cmd).args(parts).status();
+                    if status.is_err() {
+                        // spawn / wait 失败时降级，避免 REPL 中断
+                        println!("{}: command not found", line);
+                    }
+                } else {
+                    println!("{}: command not found", line);
+                }
             }
         }
     }
