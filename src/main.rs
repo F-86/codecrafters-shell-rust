@@ -1,5 +1,9 @@
 use std::io::{self, BufRead, Write};
 
+/// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
+/// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
+const BUILTINS: &[&str] = &["echo", "exit", "type"];
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -47,6 +51,16 @@ fn main() {
                 // 将剩余参数用单空格连接后打印
                 let output = parts.collect::<Vec<&str>>().join(" ");
                 println!("{}", output);
+            }
+            "type" => {
+                // 取首个参数作为查询目标；无参时不输出，进入下一轮 REPL
+                if let Some(target) = parts.next() {
+                    if BUILTINS.contains(&target) {
+                        println!("{} is a shell builtin", target);
+                    } else {
+                        println!("{}: not found", target);
+                    }
+                }
             }
             _ => {
                 println!("{}: command not found", line);
