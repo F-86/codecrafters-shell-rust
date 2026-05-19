@@ -29,7 +29,23 @@ fn main() {
             continue;
         }
 
-        // 5. 本阶段所有命令都视为未找到
-        println!("{}: command not found", line);
+        // 5. 拆分命令和参数
+        let mut parts = line.split_whitespace();
+        let cmd = match parts.next() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // 6. 内建命令分发
+        match cmd {
+            "exit" => {
+                // 可选退出码，解析失败回退为 0
+                let code = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                std::process::exit(code);
+            }
+            _ => {
+                println!("{}: command not found", line);
+            }
+        }
     }
 }
