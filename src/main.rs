@@ -6,7 +6,7 @@ use std::process::Command;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
-const BUILTINS: &[&str] = &["echo", "exit", "type"];
+const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd"];
 
 /// 按 PATH 顺序查找可执行文件。
 /// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
@@ -75,6 +75,15 @@ fn main() {
                 // 将剩余参数用单空格连接后打印
                 let output = parts.collect::<Vec<&str>>().join(" ");
                 println!("{}", output);
+            }
+            "pwd" => {
+                // 打印当前工作目录的绝对路径；忽略多余参数（与 POSIX 宽松行为一致）
+                // current_dir() 内部调用 getcwd(2)，由 OS 保证返回绝对路径
+                match std::env::current_dir() {
+                    Ok(path) => println!("{}", path.display()),
+                    // 目录被删除 / 无权限等异常场景：报错但不中断 REPL
+                    Err(e) => eprintln!("pwd: {}", e),
+                }
             }
             "type" => {
                 // 取首个参数作为查询目标；无参时不输出，进入下一轮 REPL
