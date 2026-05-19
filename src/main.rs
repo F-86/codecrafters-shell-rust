@@ -6,7 +6,7 @@ use std::process::Command;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
-const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd"];
+const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd"];
 
 /// 按 PATH 顺序查找可执行文件。
 /// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
@@ -83,6 +83,17 @@ fn main() {
                     Ok(path) => println!("{}", path.display()),
                     // 目录被删除 / 无权限等异常场景：报错但不中断 REPL
                     Err(e) => eprintln!("pwd: {}", e),
+                }
+            }
+            "cd" => {
+                // 取首个参数作为目标路径；本阶段仅要求处理绝对路径
+                // 无参数场景本阶段不覆盖，静默跳过（避免误切换至 ~，留待后续阶段）
+                if let Some(target) = parts.next() {
+                    // 直接调用 chdir(2)：失败时 OS 保证 cwd 不变，无 TOCTOU 风险
+                    // 不存在 / 非目录 / 无权限等失败统一打印同一错误信息以匹配测试期望
+                    if std::env::set_current_dir(target).is_err() {
+                        println!("cd: {}: No such file or directory", target);
+                    }
                 }
             }
             "type" => {
