@@ -86,14 +86,27 @@ fn main() {
                 }
             }
             "cd" => {
-                // 取首个参数作为目标路径；支持绝对路径与相对路径（./、../、子目录名）
+                // 取首个参数作为目标路径；支持绝对路径、相对路径（./、../、子目录名）与 ~
                 // 相对路径由内核基于当前进程 cwd 解析，无需在此做字符串展开
-                // 无参数场景本阶段不覆盖，静默跳过（避免误切换至 ~，留待后续阶段）
+                // 无参数场景本阶段不覆盖，静默跳过
                 if let Some(target) = parts.next() {
+                    // ~ 展开：本阶段仅匹配精确 "~"，不处理 ~/subdir 或 ~user 形式
+                    // HOME 缺失时按统一错误格式输出，避免 unwrap 导致 REPL 中断
+                    let resolved = if target == "~" {
+                        match std::env::var("HOME") {
+                            Ok(home) => home,
+                            Err(_) => {
+                                println!("cd: {}: No such file or directory", target);
+                                continue;
+                            }
+                        }
+                    } else {
+                        target.to_string()
+                    };
                     // 直接调用 chdir(2)：失败时 OS 保证 cwd 不变，无 TOCTOU 风险
                     // 不存在 / 非目录 / 无权限等失败统一打印同一错误信息以匹配测试期望
-                    // 错误信息回显用户原始输入，不做路径归一化（与 bash 行为一致）
-                    if std::env::set_current_dir(target).is_err() {
+                    // 错误信息回显用户原始输入 target，不展开为 home 路径（与 bash 行为一致）
+                    if std::env::set_current_dir(&resolved).is_err() {
                         println!("cd: {}: No such file or directory", target);
                     }
                 }
