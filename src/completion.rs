@@ -8,15 +8,22 @@
 //! - 去重：同名时 **builtin 优先**，PATH 同名忽略；PATH 内部不同目录的同名也只取首个，
 //!   与 `find_in_path` 按 PATH 顺序解析的执行行为对齐。用 `HashSet<&str>` 跟踪已加入名字。
 //!
-//! 双 TAB 状态机（多候选场景）：
+//! 多候选状态机（四态）：
 //! - **0 候选**：no-op，line 不变。
 //! - **1 候选**：直接替换为 `<name> `（末尾空格），与单候选 stage 行为一致。
-//! - **≥2 候选 + 首次 TAB**：写 BEL（`\x07`）响铃，line 不变；通过 `last_tab_prefix`
-//!   记住此次前缀。
-//! - **≥2 候选 + 二次 TAB（前缀未变）**：换行后按字母序、双空格分隔列出全部候选；
-//!   再换一行重画 `"$ <prefix>"`，让用户在原前缀上继续输入。
-//! - **状态重置**：候选数变为 0/1，或前缀与上次记忆不同（用户在两次 TAB 间敲了字符）→
-//!   清 `last_tab_prefix`，下次多候选重新进入"首次响铃"。
+//! - **≥2 候选 + LCP 可扩展（`lcp.len() > prefix.len()`）**：把 `line[0..pos]` 替换为
+//!   最长公共前缀 LCP，光标停 LCP 末尾，**不加尾空格**；通过单 Pair 让 rustyline
+//!   走与「1 候选」同一替换路径，零额外打印。
+//! - **≥2 候选 + LCP 不可扩展（`lcp == prefix`）**：进入双 TAB 路径——
+//!     - 首次 TAB：写 BEL（`\x07`）响铃，line 不变，`last_tab_prefix` 记住此次前缀。
+//!     - 二次 TAB（前缀未变）：换行后按字母序、双空格分隔列出全部候选；再换一行重画
+//!       `"$ <prefix>"`，让用户在原前缀上继续输入。
+//! - **状态重置**：候选数变为 0/1、LCP 扩展成功、或前缀与上次记忆不同（用户在两次
+//!   TAB 间敲了字符）→ 清 `last_tab_prefix`，下次多候选重新进入"首次响铃"。
+//!
+//! LCP 算法：候选已字典序排序后，**首末两项的公共前缀 == 全集 LCP**（介于首末之间
+//! 的串其各位置字符必落于首末项相应位置之间或相等，故全集 LCP 与首末项 LCP 相等）。
+//! O(n + L) 优于朴素 O(n·L)。
 //!
 //! 提示符常量同步：重画时使用的 `"$ "` 必须与 `main.rs::editor.readline("$ ")`
 //! 字面一致；若修改提示符样式需同步两处。
@@ -115,8 +122,22 @@ impl Completer for ShellHelper {
                 Ok((0, vec![pair]))
             }
             _ => {
-                // 多候选：按字母序排序后进入双 TAB 状态机
+                // 多候选：先字母序排序，再判断 LCP 是否可扩展
                 names.sort();
+                // 首末项的 LCP 即全集 LCP（已排序前提下）
+                let last = names.last().unwrap();
+                let lcp = longest_common_prefix(&names[0], last);
+                if lcp.len() > prefix.len() {
+                    // LCP 扩展：清状态 + 让 rustyline 把 line[0..pos] 替换为 lcp（不带尾空格）
+                    self.last_tab_prefix.set(None);
+                    let s = lcp.to_string();
+                    let pair = Pair {
+                        display: s.clone(),
+                        replacement: s,
+                    };
+                    return Ok((0, vec![pair]));
+                }
+                // LCP == prefix：无法扩展，进入双 TAB 状态机
                 let prev = self.last_tab_prefix.take();
                 let same_as_prev = prev.as_deref() == Some(prefix);
                 if same_as_prev {
@@ -146,3 +167,39 @@ impl Hinter for ShellHelper {
 impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
+
+/// 返回 `a` 与 `b` 的最长公共前缀切片（按 UTF-8 char 边界安全截取）。
+///
+/// 实现说明：用 `char_indices` 同步遍历两串，遇到首个不一致字符即按其字节起点切片；
+/// 若一串先耗尽则较短串自身即为 LCP。返回值借自 `a`，生命周期与 `a` 一致。
+fn longest_common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let mut ai = a.char_indices();
+    let mut bi = b.char_indices();
+    loop {
+        match (ai.next(), bi.next()) {
+            (Some((i, ca)), Some((_, cb))) if ca == cb => {
+                // 继续比较；记住下一个 char 的起点用作潜在切点
+                let _ = i;
+            }
+            (Some((i, _)), Some(_)) => return &a[..i], // 首个不一致字符在 a 的字节位置 i
+            (None, _) => return a,                     // a 已全部覆盖
+            (Some((i, _)), None) => return &a[..i],    // b 已耗尽，截到 a 的当前位置
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::longest_common_prefix as lcp;
+
+    #[test]
+    fn lcp_basic() {
+        assert_eq!(lcp("xyz_foo", "xyz_foo_bar"), "xyz_foo");
+        assert_eq!(lcp("xyz_foo_bar", "xyz_foo_bar_baz"), "xyz_foo_bar");
+        assert_eq!(lcp("xyz_bar", "xyz_quz"), "xyz_");
+        assert_eq!(lcp("abc", "xyz"), "");
+        assert_eq!(lcp("", "abc"), "");
+        assert_eq!(lcp("abc", ""), "");
+        assert_eq!(lcp("same", "same"), "same");
+    }
+}
