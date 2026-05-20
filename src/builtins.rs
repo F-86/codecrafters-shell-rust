@@ -7,6 +7,7 @@
 //! `find_in_path` 既被 `run_type` 用于命中判定，也被 `exec::run_external` 用于外部
 //! 命令解析，故放在本模块作为单一数据源。
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -160,11 +161,38 @@ pub fn run_cd(err_sink: &mut dyn Write, args: &[String]) {
 /// - 其他形态（无参 / 仅 `-p` / 其他 flag / 单个非 flag 参数）：本阶段题目未规定，
 ///   静默 `Ok(())` 返回，避免污染 codecrafters 后续阶段预期输出。规格存储与
 ///   `complete -C` 注册等能力留待后续阶段。
-pub fn run_complete(err_sink: &mut dyn Write, args: &[String]) -> io::Result<()> {
-    if args.first().map(|s| s.as_str()) == Some("-p") {
-        if let Some(name) = args.get(1) {
-            return writeln!(err_sink, "complete: {}: no completion specification", name);
+/// `complete` 内建：本阶段支持
+///   1. `-C <path> <cmd>`：把 `<cmd> -> <path>` 写入跨命令存活的 `registry`，无输出
+///   2. `-p <cmd>` 命中：向 sink（stdout）输出 `complete -C '<path>' <cmd>`
+///   3. `-p <cmd>` 未命中：向 err_sink（stderr）输出
+///      `complete: <cmd>: no completion specification`（上阶段行为）
+///   4. 其他形态：静默 `Ok(())`（与 `run_type` 风格一致，避免污染后续阶段预期）
+///
+/// 多空格归一化由上游 tokenizer 已经完成（dispatch 收到的 args 已是干净 token），
+/// 本函数不再处理任何空白；单引号是字面 ASCII 0x27，与 shell 转义无关。
+pub fn run_complete(
+    sink: &mut dyn Write,
+    err_sink: &mut dyn Write,
+    args: &[String],
+    registry: &mut HashMap<String, String>,
+) -> io::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        Some("-C") => {
+            // `-C <path> <cmd>`：注册补全脚本；后续多余参数忽略（与 bash 容差一致）
+            if let (Some(path), Some(cmd)) = (args.get(1), args.get(2)) {
+                registry.insert(cmd.clone(), path.clone());
+            }
+            Ok(())
         }
+        Some("-p") => {
+            if let Some(cmd) = args.get(1) {
+                if let Some(path) = registry.get(cmd) {
+                    return writeln!(sink, "complete -C '{}' {}", path, cmd);
+                }
+                return writeln!(err_sink, "complete: {}: no completion specification", cmd);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 
 mod builtins;
@@ -33,6 +34,10 @@ fn main() {
         }
     };
     editor.set_helper(Some(ShellHelper::new()));
+
+    // `complete -C <path> <cmd>` 注册的补全脚本表（command → completer path）。
+    // 放在 REPL 主循环外以跨命令存活；单线程 REPL 故无并发需求，不需要 static/Mutex。
+    let mut completions: HashMap<String, String> = HashMap::new();
 
     loop {
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
@@ -130,7 +135,7 @@ fn main() {
                 }
             }
             "complete" => {
-                if let Err(e) = run_complete(&mut *err_sink, args) {
+                if let Err(e) = run_complete(&mut *sink, &mut *err_sink, args, &mut completions) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
