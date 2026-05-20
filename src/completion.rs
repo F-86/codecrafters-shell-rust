@@ -84,12 +84,12 @@ impl ShellHelper {
     /// `Completer::complete` 入口完成，本方法不再重复。
     ///
     /// 行为：
-    /// - prefix 提取失败（tokenize 错误 / 末尾空白 / 无 token）→ 静默 no-op，
-    ///   不响铃（避免对未闭合引号场景产生噪音）。
+    /// - prefix 提取失败（tokenize 错误等）→ 静默 no-op，不响铃（避免未闭合引号噪音）。
+    /// - 末尾空白 → `prefix = ""`：等价于"列出 cwd 全部 entry"，由后续候选数分支统一处理。
     /// - 字面对齐校验失败（line 字面尾段 != prefix；引号被剥离会触发）→ no-op，
     ///   留给后续 stage 实现引号场景。
     /// - 候选数 0 或 ≥2 → BEL 响铃，line 不变。
-    /// - 候选数 = 1 → 把 `[pos - prefix.len(), pos)` 区间替换为 `<name> `。
+    /// - 候选数 = 1 → 把 `[pos - prefix.len(), pos)` 区间替换为 `<full> ` 或 `<full>/`。
     ///
     /// 不读不写 `self.last_tab_prefix`：双 TAB 状态机仅服务于命令名补全。
     fn complete_filename_arg(
@@ -99,10 +99,11 @@ impl ShellHelper {
     ) -> Result<(usize, Vec<Pair>)> {
         let line_to_pos = &line[..pos];
 
-        // 1. 提取前缀；任一失败路径 → 静默 no-op
+        // 1. 提取前缀；tokenize 失败 → 静默 no-op。空 prefix（末尾空白）是合法输入：
+        //    语义为"列出 cwd 全部 entry"，与 `dir/<TAB>` 列 `dir/` 全部 entry 同构。
         let prefix = match extract_arg_prefix(line_to_pos) {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok((pos, Vec::new())),
+            Some(p) => p,
+            None => return Ok((pos, Vec::new())),
         };
 
         // 2. 字面对齐校验：本 stage 测试不含引号/转义，故 prefix 与 line 末尾
@@ -266,20 +267,21 @@ fn longest_common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 /// 从「光标左侧子串」中提取参数位置补全的前缀。
 ///
 /// 输入约定：调用方已确认 `line_to_pos` 至少含一个空白（即处于参数区，不再是命令名）。
-/// 返回 `None` 表示当前路径下应 no-op（不响铃也不补全）：
-/// - tokenize 失败（未闭合引号等）；
-/// - `line_to_pos` 末尾是空白：用户刚结束一个 token 就按 TAB，prefix 为空，
-///   本 stage 不实现"列出全部"，故按 no-op 处理；
-/// - tokens 为空（理论不可达，防御性）。
 ///
-/// 末尾非空白时，返回 `Some(tokens.last().clone())`：tokenize 折叠了空白并按
-/// 引号语义剥离，所以这是用户正在键入的"逻辑前缀"。
-/// 注：本 stage 测试不含引号/转义，所以逻辑前缀与 line 中字面子串等长；调用方
+/// 返回值：
+/// - `Some(String::new())`：末尾是空白，用户在 token 边界按 TAB；语义为"列出 cwd
+///   全部 entry"（空 prefix 与任何叶子名 `starts_with("")` 永真，由调用方统一处理）。
+/// - `Some(prefix)`：末尾非空白，返回 tokenize 后的最后一个 token —— 用户正在键入
+///   的"逻辑前缀"。tokenize 折叠了空白并按引号语义剥离。
+/// - `None`：tokenize 失败（未闭合引号、行尾孤立反斜杠等）；调用方按静默 no-op 处理，
+///   不响铃以免对未闭合引号场景产生噪音。
+///
+/// 注：本 stage 测试不含引号/转义，所以非空 prefix 与 line 中字面子串等长；调用方
 /// 仍需做一道字面对齐校验以兜底未覆盖的情形（见 `complete_filename_arg`）。
 fn extract_arg_prefix(line_to_pos: &str) -> Option<String> {
-    // 末尾空白 → prefix 为空 → no-op（避免列出全部）
+    // 末尾空白 → 空 prefix（"列出全部"语义），不再走 tokenize 取最后 token
     if line_to_pos.chars().next_back().map_or(true, |c| c.is_whitespace()) {
-        return None;
+        return Some(String::new());
     }
     let tokens = tokenize(line_to_pos).ok()?;
     tokens.into_iter().last()
@@ -411,12 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn extract_prefix_trailing_space_returns_none() {
-        // 末尾空白：prefix 为空，本 stage 按 no-op
-        assert_eq!(extract_arg_prefix("cat re "), None);
-        assert_eq!(extract_arg_prefix("cat "), None);
-        // 多空白同样返回 None
-        assert_eq!(extract_arg_prefix("cat   "), None);
+    fn extract_prefix_trailing_space_returns_empty() {
+        // 末尾空白 → 空 prefix（"列出全部"语义），由调用方按候选数分支统一处理
+        assert_eq!(extract_arg_prefix("cat re "), Some(String::new()));
+        assert_eq!(extract_arg_prefix("cat "), Some(String::new()));
+        // 多空白同样返回空 prefix
+        assert_eq!(extract_arg_prefix("cat   "), Some(String::new()));
     }
 
     #[test]
