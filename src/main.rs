@@ -9,7 +9,7 @@ mod exec;
 mod parser;
 mod redirect;
 
-use builtins::{run_cd, run_complete, run_echo, run_pwd, run_type};
+use builtins::{run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type};
 use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
@@ -148,6 +148,14 @@ fn main() {
                     args,
                     &mut *completions.borrow_mut(),
                 ) {
+                    eprintln!("shell: write error: {}", e);
+                }
+            }
+            "jobs" => {
+                // 本阶段空实现：无输出、立刻返回提示符。
+                // 仍走完整 sink / err_sink dispatch 通道，便于后续阶段填充
+                // 任务列表逻辑时无需改动 main.rs。
+                if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args) {
                     eprintln!("shell: write error: {}", e);
                 }
             }

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
-pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete"];
+pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete", "jobs"];
 
 /// 按 PATH 顺序查找可执行文件。
 /// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
@@ -210,6 +210,30 @@ pub fn run_complete(
         }
         _ => Ok(()),
     }
+}
+
+/// `jobs` 内建：列出当前 shell 已知的后台任务（job number / 状态 / 命令）。
+///
+/// 本阶段为**空实现占位**——题面 Notes 明确：真实任务列表逻辑（伴随 `&` 后台执行、
+/// SIGCHLD 回收、状态机等）留待后续阶段。当前能力清单：
+/// - `BUILTINS` 已追加 `"jobs"`，故 `type jobs` 命中 `run_type` 的 builtin 分支，
+///   输出 `jobs is a shell builtin`（走 sink，可被 `1>` / `>` 重定向）；
+/// - 直接执行 `jobs` 不向 sink / err_sink 写任何字节，REPL 立刻回到提示符。
+///
+/// 签名风格刻意与 `run_type` / `run_complete` 对齐（接 sink / err_sink / args + 返回
+/// `io::Result<()>`），便于后续阶段就地扩展为真实列表打印逻辑时——
+/// dispatch 框架、错误信道、写错误传播路径**零改动**。
+///
+/// 参数前缀 `_` 仅为消除 unused 警告，并非语义弱化：后续阶段填充实现时直接去掉
+/// 下划线即可投入使用。
+pub fn run_jobs(
+    _sink: &mut dyn Write,
+    _err_sink: &mut dyn Write,
+    _args: &[String],
+) -> io::Result<()> {
+    // 本阶段无任务表数据源、无输出。后续阶段在此处遍历 job 表并按
+    // `[<n>] <status>  <cmd>` 格式逐行写入 sink。
+    Ok(())
 }
 
 #[cfg(test)]
