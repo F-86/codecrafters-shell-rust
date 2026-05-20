@@ -1,15 +1,22 @@
-//! 命令行词法分析器（tokenizer）。
+//! 命令行词法分析器（tokenizer）+ 命令结构化解析器（parser）。
 //!
-//! 当前支持单引号、双引号与「引号外反斜杠转义」语义：
-//! - 单引号内任何字符（含空格、`$`、`*`、`~`、`"`、`\`、Tab 等）按字面量保留；
-//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;` 等）；`\` 仅对
+//! 当前支持单引号、双引号、「引号外反斜杠转义」与 `>` / `1>` 重定向操作符语义：
+//! - 单引号内任何字符（含空格、`$`、`*`、`~`、`"`、`\`、`>`、Tab 等）按字面量保留；
+//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;`、`>` 等）；`\` 仅对
 //!   `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义并吃掉自身，其他字符前 `\` 按字面量
 //!   保留；`$` 仍按字面量（变量展开留待后续阶段）；
 //! - 引号外 `\X` 移除 `X` 的特殊含义并按字面量保留 `X`，反斜杠本身被丢弃，
-//!   适用于任意下一字符（含空白、`'`、`"`、`$`、`*` 等及普通字母）；行尾孤立 `\`
+//!   适用于任意下一字符（含空白、`'`、`"`、`$`、`*`、`>` 等及普通字母）；行尾孤立 `\`
 //!   视为语法错误（`TrailingBackslash`）；
 //! - 引号外连续空白作为 token 分隔符并被折叠；
-//! - 任意相邻的引号串 / 空引号 / 裸字符串 / 转义字符可无缝拼接成同一个 argument。
+//! - 任意相邻的引号串 / 空引号 / 裸字符串 / 转义字符可无缝拼接成同一个 argument；
+//! - 引号外 `>` 与 `1>` 被识别为独立 token：当且仅当 `>` 紧贴在裸字符 `1` 之后（中间无
+//!   空白、无引号、无转义）时合并为单 token `"1>"`，其余情形 `>` 单独成 token；引号
+//!   内 `>` 仍按字面量。
+//!
+//! 上层 `parse` 函数在 `tokenize` 输出基础上识别 `>` / `1>` 操作符（两者等价），
+//! 把其后第一个 token 作为 stdout 重定向目标，剩余 token 作为 argv，组装出
+//! [`ParsedCommand`]。
 
 use std::fmt;
 
@@ -24,6 +31,8 @@ pub enum ParseError {
     UnterminatedDoubleQuote,
     /// 行末为孤立反斜杠（无字符可转义）。
     TrailingBackslash,
+    /// `>` / `1>` 后没有目标文件 token（例如 `echo hello >`）。
+    MissingRedirectTarget,
 }
 
 impl fmt::Display for ParseError {
@@ -37,6 +46,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::TrailingBackslash => {
                 write!(f, "syntax error: trailing backslash")
+            }
+            ParseError::MissingRedirectTarget => {
+                write!(f, "syntax error: missing redirect target")
             }
         }
     }
@@ -96,6 +108,24 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     // 开启双引号段；与单引号路径完全对称
                     state = State::InDoubleQuote;
                     in_token = true;
+                }
+                '>' => {
+                    // 重定向操作符 `>`：作为独立 token 切出。
+                    // 特例：若当前正在累积的 token 恰好是裸字符 `1`（隐含 `1` 与 `>`
+                    // 之间无空白、无引号、无转义——任何此类间隔都会先 flush 出 `1`
+                    // 或在 current 中混入其他字符，使 `current != "1"`），则把 token
+                    // 升级为 `"1>"`，与 bash 的 `1>` 重定向语义对齐。其余情况下，
+                    // 先 flush 当前 token（若有），再单独 push `">"` 作为操作符 token。
+                    if in_token && current == "1" {
+                        current.clear();
+                        tokens.push("1>".to_string());
+                    } else if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        tokens.push(">".to_string());
+                    } else {
+                        tokens.push(">".to_string());
+                    }
+                    in_token = false;
                 }
                 c if c.is_whitespace() => {
                     // 引号外空白：若已有 token 则结束之；否则跳过连续空白
@@ -166,6 +196,51 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
     }
 
     Ok(tokens)
+}
+
+/// 结构化的一条命令：去除重定向元信息后的 argv，加上可选的 stdout 重定向目标。
+///
+/// 当前阶段仅支持 stdout 重定向（`>` / `1>`）；后续阶段可在此扩展 stderr / 追加 /
+/// stdin 等字段而不需调整 [`tokenize`] 与上层 REPL 的契约。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedCommand {
+    /// 命令名 + 参数（不含任何重定向操作符或目标文件 token）。
+    /// 当输入是仅含空白或仅含重定向（如 `> out`）时，`argv` 可能为空——由上层 REPL 决定如何处理。
+    pub argv: Vec<String>,
+    /// stdout 重定向目标文件路径；`None` 表示未指定重定向。
+    /// `>` 与 `1>` 完全等价，归一化在本函数内完成。
+    pub stdout_redirect: Option<String>,
+}
+
+/// 把一行输入解析为 [`ParsedCommand`]。
+///
+/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再单次线性扫描识别 `>` / `1>`：
+/// 把紧随其后的 token 作为 `stdout_redirect`，其余按顺序追加进 `argv`。
+///
+/// 错误传播：tokenize 阶段的语法错误原样返回；若 `>` / `1>` 后无下一 token，
+/// 返回 [`ParseError::MissingRedirectTarget`]。重复出现的重定向（如 `> a > b`）
+/// 取**最后一次**为准，与 bash 行为一致（前面的目标文件依然被创建/截断，但本阶段
+/// spec 不要求该副作用，故仅记录最后一次即可）。
+pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
+    let tokens = tokenize(input)?;
+    let mut argv: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut stdout_redirect: Option<String> = None;
+    let mut iter = tokens.into_iter();
+    while let Some(tok) = iter.next() {
+        // 归一化：`>` 与 `1>` 都被识别为「stdout 重定向」操作符
+        if tok == ">" || tok == "1>" {
+            match iter.next() {
+                Some(target) => stdout_redirect = Some(target),
+                None => return Err(ParseError::MissingRedirectTarget),
+            }
+        } else {
+            argv.push(tok);
+        }
+    }
+    Ok(ParsedCommand {
+        argv,
+        stdout_redirect,
+    })
 }
 
 #[cfg(test)]
@@ -503,5 +578,167 @@ mod tests {
     fn backslash_inside_single_quote_unchanged() {
         // 回归守护：单引号内反斜杠仍按字面量（spec 范围之外，不应被本阶段改动影响）
         assert_eq!(tokenize(r"echo 'a\b\\c'").unwrap(), vec!["echo", r"a\b\\c"]);
+    }
+
+    // ===== 引号包裹的可执行文件名（quoted executable names） =====
+    // 目的：守护 tokens[0] 与 args 共享同一套引号/转义解析的契约，
+    //       防止后续重构在「第一个 token」上引入特殊路径而破坏 spec 行为。
+
+    #[test]
+    fn quoted_executable_single_quoted_with_space() {
+        // spec 入门样例：`'my program' argument1` → 可执行名 `my program`，参数 `argument1`
+        assert_eq!(
+            tokenize("'my program' argument1").unwrap(),
+            vec!["my program", "argument1"]
+        );
+    }
+
+    #[test]
+    fn quoted_executable_double_quoted_with_space() {
+        // spec 入门样例：`"exe with spaces" file.txt` → 可执行名 `exe with spaces`，参数 `file.txt`
+        assert_eq!(
+            tokenize(r#""exe with spaces" file.txt"#).unwrap(),
+            vec!["exe with spaces", "file.txt"]
+        );
+    }
+
+    #[test]
+    fn quoted_executable_double_quoted_contains_single_quote() {
+        // spec 测试样例：`"exe with 'single quotes'" file`
+        // 双引号内单引号是字面量，可执行名最终为 `exe with 'single quotes'`
+        assert_eq!(
+            tokenize(r#""exe with 'single quotes'" file"#).unwrap(),
+            vec!["exe with 'single quotes'", "file"]
+        );
+    }
+
+    #[test]
+    fn quoted_executable_single_quoted_contains_double_quote() {
+        // spec 测试样例：`'exe with "quotes"' file`
+        // 单引号内双引号是字面量，可执行名最终为 `exe with "quotes"`
+        assert_eq!(
+            tokenize(r#"'exe with "quotes"' file"#).unwrap(),
+            vec![r#"exe with "quotes""#, "file"]
+        );
+    }
+
+    // ===== 重定向操作符（`>` / `1>`）切分 =====
+    // 目的：确保 `>` / `1>` 在引号外被切为独立 token；引号内仍按字面量；
+    //       既有 32 个测试用例均不含 `>` 字符，故新增切分逻辑不引入回归。
+
+    #[test]
+    fn redirect_gt_is_standalone_token_when_spaced() {
+        // 空格分隔形态：`echo hello > out` → `>` 独立 token
+        assert_eq!(
+            tokenize("echo hello > out").unwrap(),
+            vec!["echo", "hello", ">", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_gt_splits_adjacent_token() {
+        // 紧贴形态：`echo hello>out` → 仍切出 `>` 独立 token
+        assert_eq!(
+            tokenize("echo hello>out").unwrap(),
+            vec!["echo", "hello", ">", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_1gt_merges_only_when_adjacent() {
+        // 紧贴 `1>` 合并：`echo hi 1>out` → `1>` 单 token
+        assert_eq!(
+            tokenize("echo hi 1>out").unwrap(),
+            vec!["echo", "hi", "1>", "out"]
+        );
+        // 空格分隔形态：`echo hi 1> out` → 同样合并（因为 `1` 与 `>` 之间无空白）
+        assert_eq!(
+            tokenize("echo hi 1> out").unwrap(),
+            vec!["echo", "hi", "1>", "out"]
+        );
+        // 关键负样例：`1` 与 `>` 之间有空白 → 不合并，`1` 是普通 arg，`>` 是独立操作符
+        assert_eq!(
+            tokenize("echo 1 > out").unwrap(),
+            vec!["echo", "1", ">", "out"]
+        );
+        // 关键负样例：`a1>out` 中 `1` 是字符串后缀而非孤立 token → 不合并
+        assert_eq!(
+            tokenize("echo a1>out").unwrap(),
+            vec!["echo", "a1", ">", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_gt_inside_quotes_is_literal() {
+        // 单引号内 `>` 是字面量
+        assert_eq!(
+            tokenize("echo '> not redirect'").unwrap(),
+            vec!["echo", "> not redirect"]
+        );
+        // 双引号内 `>` 与 `1>` 都是字面量
+        assert_eq!(
+            tokenize(r#"echo "a > b" "1> c""#).unwrap(),
+            vec!["echo", "a > b", "1> c"]
+        );
+        // 引号外反斜杠转义 `>` → 按字面量保留，不再被识别为操作符
+        assert_eq!(
+            tokenize(r"echo a\>b").unwrap(),
+            vec!["echo", "a>b"]
+        );
+    }
+
+    // ===== parse 层：ParsedCommand 结构化 =====
+
+    #[test]
+    fn parse_without_redirect_returns_argv_only() {
+        let p = parse("echo hello world").unwrap();
+        assert_eq!(p.argv, vec!["echo", "hello", "world"]);
+        assert_eq!(p.stdout_redirect, None);
+    }
+
+    #[test]
+    fn parse_gt_extracts_redirect_target() {
+        // 空格分隔形态
+        let p = parse("echo hello > out.txt").unwrap();
+        assert_eq!(p.argv, vec!["echo", "hello"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        // 紧贴形态
+        let p = parse("echo hello>out.txt").unwrap();
+        assert_eq!(p.argv, vec!["echo", "hello"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+    }
+
+    #[test]
+    fn parse_1gt_is_equivalent_to_gt() {
+        // `1>` 与 `>` 归一化为同一语义：stdout 重定向
+        let p = parse("echo Hello James 1> /tmp/foo/foo.md").unwrap();
+        assert_eq!(p.argv, vec!["echo", "Hello", "James"]);
+        assert_eq!(p.stdout_redirect, Some("/tmp/foo/foo.md".to_string()));
+        // 紧贴 1> 形态同样生效
+        let p = parse("echo a 1>out").unwrap();
+        assert_eq!(p.argv, vec!["echo", "a"]);
+        assert_eq!(p.stdout_redirect, Some("out".to_string()));
+    }
+
+    #[test]
+    fn parse_missing_redirect_target_errors() {
+        // `>` 后无 token → 报 MissingRedirectTarget
+        assert_eq!(
+            parse("echo hello >"),
+            Err(ParseError::MissingRedirectTarget)
+        );
+        // `1>` 后无 token 同理
+        assert_eq!(
+            parse("echo hello 1>"),
+            Err(ParseError::MissingRedirectTarget)
+        );
+    }
+
+    #[test]
+    fn parse_redirect_target_preserves_quoting() {
+        // 目标文件名可被引号包裹（含空格）；parse 不应丢失内容
+        let p = parse(r#"echo hi > "/tmp/with space.txt""#).unwrap();
+        assert_eq!(p.argv, vec!["echo", "hi"]);
+        assert_eq!(p.stdout_redirect, Some("/tmp/with space.txt".to_string()));
     }
 }
