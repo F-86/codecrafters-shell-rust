@@ -250,44 +250,66 @@ impl Completer for ShellHelper {
         // （前导空白即进入参数区，与 bash 行为一致；空命令名场景由文件名分支自然 no-op）。
         let prefix = &line[..pos];
         if prefix.chars().any(|c| c.is_whitespace()) {
-            // ---- 命令级补全分支：`<cmd> <空白...> <TAB>` 形态优先调注册脚本 ----
+            // ---- 命令级补全分支：首词已结束的全部场景优先调注册脚本 ----
             //
-            // 严格触发条件由 `extract_command_only` 判定：可选前导空白 + 单 token + ≥1 空白结尾，
-            // 即光标停在「命令名后第一个参数位置且当前 token 为空」。其他形态（已键入参数前缀、
-            // 多 token、引号场景等）一律落回既有 `complete_filename_arg`。
+            // 触发条件由 `extract_completer_context` 判定：含至少一个空白 + tokenize 成功
+            //（即首词已结束，无论 cursor 处 token 是否为空、前面有多少 token）。
+            // tokenize 失败（未闭合引号 / 行尾孤立反斜杠）→ ctx = None → 回退既有
+            // `complete_filename_arg` 的静默路径。
             //
             // registry 查询：先用 `borrow()` 取出后 `cloned()` 立即释放借用，再 spawn 子进程
             // （避免 Command::output() 阻塞期间持续持有 RefCell 借用）。
             //
-            // 行为分支：
-            // - 严格形态命中 + registry 命中 + 脚本成功 → 返回单候选 `<text> `（按用户决策 1+3）
-            // - 严格形态命中 + registry 未命中 → 回退 complete_filename_arg（用户决策 2）
-            // - 严格形态命中 + registry 命中 + 脚本失败/空 → 静默 no-op，line 不变
-            //   （用户决策 3：脚本失败不回退到文件名补全，避免污染交互体验）
-            // - 非严格形态 → 回退 complete_filename_arg
-            if let Some(cmd) = extract_command_only(prefix) {
+            // 行为分支（按用户决策）：
+            // - ctx 命中 + registry 命中 + 脚本成功 → 单候选替换 `[pos - literal_len, pos)`
+            //   区段为 `<text> `；literal_len = 0 时退化为纯插入（与上 stage 等价）
+            // - ctx 命中 + registry 命中 + 脚本失败/空 → 静默 no-op，line 不变
+            //   （决策 4：脚本失败不响铃、不回退到文件名补全）
+            // - ctx 命中 + registry 未命中 → 静默 no-op（决策 5：与 bash `complete -C`
+            //   严格语义对齐，未注册命令不再走文件名补全）
+            // - ctx 提取失败（tokenize 错）→ 回退 complete_filename_arg
+            if let Some(ctx) = extract_completer_context(prefix) {
+                // 命令级分支被触发：清掉对侧双 TAB 状态机
+                self.last_tab_prefix.set(None);
+                self.last_tab_arg_key.set(None);
+
                 let registered: Option<String> =
-                    self.completions.borrow().get(cmd).cloned();
-                if let Some(path) = registered {
-                    // 命令级补全分支被触发：清空对侧双 TAB 状态机
-                    self.last_tab_prefix.set(None);
-                    self.last_tab_arg_key.set(None);
-                    return match run_completer_script(&path) {
-                        Some(text) => {
-                            // 单候选：起点 = pos（光标处），整体插入 `<text> `
-                            let pair = Pair {
-                                display: text.clone(),
-                                replacement: format!("{} ", text),
-                            };
-                            Ok((pos, vec![pair]))
-                        }
-                        // 脚本异常：静默 no-op（不响铃、不回退、不报错）
-                        None => Ok((pos, Vec::new())),
-                    };
+                    self.completions.borrow().get(&ctx.cmd).cloned();
+                let path = match registered {
+                    Some(p) => p,
+                    // registry 未命中：静默 no-op，不回退文件名补全
+                    None => return Ok((pos, Vec::new())),
+                };
+
+                // 字面对齐校验：literal_len 从 line 反扫得到，理论上严格落在 `line[..pos]`
+                // 区间内，pos - literal_len 不会越界；这里仅做防御性 assert-style 检查，
+                // 越界即按 no-op 退避（永不应发生）。
+                if ctx.literal_len > pos {
+                    return Ok((pos, Vec::new()));
                 }
-                // registry 未命中：fall through 到既有文件名补全
+                let start = pos - ctx.literal_len;
+
+                return match run_completer_script(
+                    &path,
+                    &ctx.cmd,
+                    &ctx.current_word,
+                    &ctx.prev_word,
+                ) {
+                    Some(text) => {
+                        // 替换 [start, pos) 区段为 `<text> `；rustyline 会把光标停在
+                        // start + replacement.len()，正好得到 `<前缀><text><空格>|`。
+                        let pair = Pair {
+                            display: text.clone(),
+                            replacement: format!("{} ", text),
+                        };
+                        Ok((start, vec![pair]))
+                    }
+                    // 脚本异常：静默 no-op（不响铃、不回退、不报错）
+                    None => Ok((pos, Vec::new())),
+                };
             }
-            // 进入参数补全分支：由 complete_filename_arg 内部负责清空 last_tab_prefix。
+            // ctx 提取失败（tokenize 错）：回退既有文件名补全（其内部按未闭合引号
+            // 场景静默 no-op，与本分支语义自然对齐）
             return self.complete_filename_arg(line, pos);
         }
 
@@ -514,45 +536,110 @@ fn format_arg_completion(full: &str, kind: MatchKind) -> Pair {
     }
 }
 
-/// 严格识别「可选前导空白 + 单个命令 token + ≥1 个空白结尾」的形态。
+/// 命令级补全上下文：`Completer::complete` dispatch 阶段从 `line[..pos]` 提取的
+/// 全部脚本调用所需信息。字段语义与 bash COMP_* 对齐。
 ///
-/// 命中条件（按用户决策 1：仅 `<cmd> <TAB>` 触发命令级补全）：
-/// - 末尾必须是 ASCII 空白字符（`' '` / `'\t'`）；否则说明用户在键入参数前缀，返回 `None`
-/// - 去掉末尾连续空白后剩余部分必须是「单个 token」：内部不含任何空白
-/// - 可选前导空白：去掉前导空白后剩余部分非空且无空白则命中
+/// - `cmd`：argv[1]，命令名（tokenize 后的首 token，已剥引号）。
+/// - `current_word`：argv[2]，当前正被补全的词（tokenize 后值，已剥引号）。末尾空白
+///   场景下为空串。
+/// - `prev_word`：argv[3]，前一词（tokenize 后值）。不存在或仅有 cmd 一个 token 时
+///   为空串。注意 prev_word **不**包含 cmd —— 仅在 cmd 之后的实参区找前一词。
+/// - `literal_len`：光标处『当前词原始字面段』的字节长度，用于计算 replacement 起点
+///   `start = pos - literal_len`。末尾空白场景为 0（纯插入），与上 stage 等价。
+///   分离 tokenized 值与字面长度，是为了在引号场景（`cmd 'fo<TAB>`）下不算错替换
+///   起点：`current_word` 给脚本看的是 `fo`，但替换起点要回到字面 `'fo` 之前。
+#[derive(Debug)]
+struct CompleterContext {
+    cmd: String,
+    current_word: String,
+    prev_word: String,
+    literal_len: usize,
+}
+
+/// 从光标左侧子串提取命令级补全上下文。
 ///
-/// 返回 `Some(&str)`：命令 token 的切片（已去除前后空白）；`None`：不满足严格形态。
+/// 命中条件（用户决策 1：触发面 = 首词已结束的全部场景）：
+/// - `line_to_pos` 含至少一个空白（已离开命令名区）
+/// - tokenize 成功（未闭合引号 / 行尾孤立反斜杠会导致 tokenize 错误，返回 None
+///   让外层回退到既有 `complete_filename_arg` 的静默路径）
+/// - tokenize 后至少有一个 token（即 cmd 存在）
 ///
-/// 实现采用 `trim_end` + `trim_start` + 内部空白扫描，避免引入 tokenize 的引号语义
-/// （本 stage 测试与决策都不要求引号处理；如果 token 含引号字符 `' " \\`，仍按字面
-/// 单 token 处理，registry 查 key 时自然 miss，不会误命中脚本）。
+/// 字面长度算法：从 `line_to_pos` 末尾向前扫描连续非空白字节，得到尾段长度。
+/// 末尾空白时 literal_len = 0；末尾非空白时 literal_len = 末尾连续非空白字节数。
+/// 用 `bytes()` + `is_ascii_whitespace`：tokenize 已按 ASCII 空白做分隔，本算法
+/// 与之保持一致；非 ASCII 字符（如中文）按非空白处理，自然纳入字面尾段。
 ///
-/// 例：
-/// - `"docker "`        → Some("docker")
-/// - `"docker   "`      → Some("docker")
-/// - `"  docker "`      → Some("docker")
-/// - `"docker arg "`    → None（内部含空白 → 多 token）
-/// - `"docker"`         → None（无尾空白 → 仍在键入命令名，不应到此分支）
-/// - `""` / `"   "`     → None（无命令 token）
-fn extract_command_only(line_to_pos: &str) -> Option<&str> {
-    // 1. 必须以空白结尾
-    if !line_to_pos.chars().next_back().map_or(false, |c| c.is_whitespace()) {
+/// prev_word 提取规则：
+/// - tokens 区间 `[1..]` 为 cmd 之后的实参；末尾空白时整个区间是已完成实参，
+///   prev = 区间最后一项；末尾非空白时区间最后一项是 current_word，prev = 倒数第二项。
+/// - 区间为空（仅 cmd）→ prev = ""。
+fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
+    // 1. 必须含至少一个空白（首词已结束）
+    if !line_to_pos.chars().any(|c| c.is_whitespace()) {
         return None;
     }
-    // 2. 同时 trim 前导与尾部空白，剩余应是单个非空 token
-    let cmd = line_to_pos.trim();
-    if cmd.is_empty() {
+    // 2. tokenize（失败 → None，由外层回退到文件名补全的静默路径）
+    let tokens = tokenize(line_to_pos).ok()?;
+    if tokens.is_empty() {
         return None;
     }
-    if cmd.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    Some(cmd)
+    let cmd = tokens[0].clone();
+
+    // 3. 末尾空白判定 → 决定 current_word 与 prev_word 的取法
+    let trailing_ws = line_to_pos
+        .chars()
+        .next_back()
+        .map_or(false, |c| c.is_whitespace());
+
+    // tokens[1..] 是 cmd 之后的实参区；prev_word 仅在该区间内查找
+    let args = &tokens[1..];
+
+    let (current_word, prev_word) = if trailing_ws {
+        // 末尾空白：current = ""；prev = args 最后一项（区间空则 ""）
+        let prev = args.last().cloned().unwrap_or_default();
+        (String::new(), prev)
+    } else {
+        // 末尾非空白：current = args 最后一项；prev = args 倒数第二项
+        // 注意：当 args 为空（仅 cmd 一个 token + 无尾空白）的形态在调用前提下不可能
+        // 出现——line_to_pos 含空白才会进入本函数，而仅 cmd 无空白时不会含空白。
+        // 但末尾空白会被消费产生 args 末项；这里仍按防御性处理：
+        //   args 至少 1 项 → current = args.last()；
+        //   args 0 项（理论不可达）→ current = ""，prev = ""。
+        let current = args.last().cloned().unwrap_or_default();
+        let prev = if args.len() >= 2 {
+            args[args.len() - 2].clone()
+        } else {
+            String::new()
+        };
+        (current, prev)
+    };
+
+    // 4. 字面长度：末尾空白 → 0；否则反向扫描连续非空白字节
+    let literal_len = if trailing_ws {
+        0
+    } else {
+        let bytes = line_to_pos.as_bytes();
+        let mut i = bytes.len();
+        while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        bytes.len() - i
+    };
+
+    Some(CompleterContext {
+        cmd,
+        current_word,
+        prev_word,
+        literal_len,
+    })
 }
 
 /// 执行已注册的补全脚本，返回 stdout 首行作为单候选；任何异常返回 `None`。
 ///
-/// 契约（按用户决策 3：脚本异常一律静默 no-op）：
+/// argv 契约（按本 stage 题面）：argv[1]=cmd, argv[2]=current_word, argv[3]=prev_word。
+/// 三参数总是同时传递；prev_word 不存在时调用方传空串（脚本仍能 `argv[3]` 取到）。
+///
+/// 失败契约（按用户决策 4：脚本异常一律静默 no-op）：
 /// - spawn 失败（路径不存在 / 权限 / non-executable）→ None
 /// - 子进程非零退出 → None（即便 stdout 有内容也丢弃）
 /// - stdout 非 UTF-8 → None
@@ -562,11 +649,21 @@ fn extract_command_only(line_to_pos: &str) -> Option<&str> {
 /// 实现说明：
 /// - `Command::output()` 内置 wait + 一次性收齐 stdout/stderr，避开题目 Notes 强调的
 ///   「读到部分输出」陷阱；不需要额外 wait/read 配对。
-/// - 不向脚本传 stdin / argv / 自定义 env（本 stage 显式禁止上下文传递；继承父进程 env
-///   即可支持 `#!/usr/bin/env python3` 等 shebang）。
-/// - 多行输出按用户决策 3 的容差："严格遵循题目"只取首行；超出首行的内容静默丢弃。
-fn run_completer_script(path: &str) -> Option<String> {
-    let output = Command::new(path).output().ok()?;
+/// - 不向脚本传 stdin / 自定义 env（继承父进程 env 即可支持
+///   `#!/usr/bin/env python3` 等 shebang）。
+/// - 多行输出按既定容差："严格遵循题目"只取首行；超出首行的内容静默丢弃。
+fn run_completer_script(
+    path: &str,
+    cmd: &str,
+    current_word: &str,
+    prev_word: &str,
+) -> Option<String> {
+    let output = Command::new(path)
+        .arg(cmd)
+        .arg(current_word)
+        .arg(prev_word)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -797,48 +894,160 @@ mod tests {
         assert_eq!(super::split_dir_and_name("f"), ("", "f"));
     }
 
-    // ---- Stage: Execute Completer Script (extract_command_only 边界) ----
-    use super::extract_command_only;
+    // ---- Stage: Pass arguments to completer (extract_completer_context) ----
+    //
+    // 覆盖矩阵：
+    // - cmd-only 形态（`docker `）：current="" prev="" literal_len=0
+    // - cmd + 已输入 prefix（`git rem`）：current="rem" prev="" literal_len=3
+    // - cmd + 完整 arg + 尾空白（`git remote `）：current="" prev="remote" literal_len=0
+    // - cmd + 完整 arg + 已输入 prefix（`git remote set`）：current="set" prev="remote" literal_len=3
+    // - 多空白结尾（`docker   `）：current="" prev="" literal_len=0
+    // - 前导空白（`  docker arg`）：current="arg" prev="" literal_len=3 （注意 prev 是 cmd 之后的实参区，cmd 本身不计入）
+    // - 无尾空白且无空白前缀（`docker`）：含空白判定失败 → None
+    // - 空 / 纯空白：None
+    // - 未闭合引号：tokenize 失败 → None
+    use super::{extract_completer_context, CompleterContext};
 
-    #[test]
-    fn cmd_only_basic_trailing_space() {
-        // 题目主例：`docker <TAB>` 严格触发
-        assert_eq!(extract_command_only("docker "), Some("docker"));
+    fn ctx(line: &str) -> Option<(String, String, String, usize)> {
+        extract_completer_context(line).map(
+            |CompleterContext { cmd, current_word, prev_word, literal_len }| {
+                (cmd, current_word, prev_word, literal_len)
+            },
+        )
     }
 
     #[test]
-    fn cmd_only_multispace() {
-        // 多空白尾仍命中（tokenize 节流由本 helper 等价处理）
-        assert_eq!(extract_command_only("docker   "), Some("docker"));
-        assert_eq!(extract_command_only("docker\t"), Some("docker"));
+    fn ctx_cmd_only_trailing_space() {
+        // `docker <TAB>`：current="" prev="" literal_len=0
+        assert_eq!(
+            ctx("docker "),
+            Some(("docker".to_string(), String::new(), String::new(), 0))
+        );
     }
 
     #[test]
-    fn cmd_only_leading_ws() {
-        // 前导空白允许（与 bash 行为一致：` docker <TAB>` 仍按 docker 触发）
-        assert_eq!(extract_command_only("  docker "), Some("docker"));
-        assert_eq!(extract_command_only(" docker   "), Some("docker"));
+    fn ctx_cmd_only_multispace() {
+        assert_eq!(
+            ctx("docker   "),
+            Some(("docker".to_string(), String::new(), String::new(), 0))
+        );
+        assert_eq!(
+            ctx("docker\t"),
+            Some(("docker".to_string(), String::new(), String::new(), 0))
+        );
     }
 
     #[test]
-    fn cmd_only_with_arg_returns_none() {
-        // 已键入参数（无论是否带尾空白）→ 非「单 token + 尾空白」形态，不命中命令级补全
-        assert_eq!(extract_command_only("docker arg "), None);
-        assert_eq!(extract_command_only("docker arg"), None);
-        assert_eq!(extract_command_only("docker run subarg "), None);
+    fn ctx_cmd_with_partial_first_arg() {
+        // `git rem<TAB>`：current="rem" prev="" literal_len=3
+        assert_eq!(
+            ctx("git rem"),
+            Some(("git".to_string(), "rem".to_string(), String::new(), 3))
+        );
     }
 
     #[test]
-    fn cmd_only_no_trailing_ws_returns_none() {
-        // 无尾空白：用户仍在键入命令名 → 应由首词命令名分支处理，本 helper 不命中
-        assert_eq!(extract_command_only("docker"), None);
-        assert_eq!(extract_command_only("d"), None);
+    fn ctx_cmd_with_complete_arg_trailing_space() {
+        // `git remote <TAB>`：current="" prev="remote" literal_len=0
+        assert_eq!(
+            ctx("git remote "),
+            Some((
+                "git".to_string(),
+                String::new(),
+                "remote".to_string(),
+                0
+            ))
+        );
     }
 
     #[test]
-    fn cmd_only_empty_and_pure_ws_returns_none() {
-        assert_eq!(extract_command_only(""), None);
-        assert_eq!(extract_command_only(" "), None);
-        assert_eq!(extract_command_only("   \t  "), None);
+    fn ctx_cmd_with_complete_arg_and_partial_next() {
+        // 题目主例 `git remote set<TAB>`：cmd="git" current="set" prev="remote" literal_len=3
+        assert_eq!(
+            ctx("git remote set"),
+            Some((
+                "git".to_string(),
+                "set".to_string(),
+                "remote".to_string(),
+                3
+            ))
+        );
+    }
+
+    #[test]
+    fn ctx_three_args_partial_last() {
+        // `git remote set foo<TAB>`：cmd="git" current="foo" prev="set" literal_len=3
+        assert_eq!(
+            ctx("git remote set foo"),
+            Some((
+                "git".to_string(),
+                "foo".to_string(),
+                "set".to_string(),
+                3
+            ))
+        );
+    }
+
+    #[test]
+    fn ctx_leading_whitespace() {
+        // 前导空白允许
+        assert_eq!(
+            ctx("  docker "),
+            Some(("docker".to_string(), String::new(), String::new(), 0))
+        );
+        assert_eq!(
+            ctx("  git remote set"),
+            Some((
+                "git".to_string(),
+                "set".to_string(),
+                "remote".to_string(),
+                3
+            ))
+        );
+    }
+
+    #[test]
+    fn ctx_no_whitespace_returns_none() {
+        // 仅命令名（无任何空白）→ 仍在键入命令名 → None，由首词分支处理
+        assert_eq!(ctx("docker"), None);
+        assert_eq!(ctx("d"), None);
+        assert_eq!(ctx(""), None);
+    }
+
+    #[test]
+    fn ctx_pure_whitespace_no_cmd() {
+        // 含空白但 tokenize 后 tokens 为空（实际上 tokenize 对纯空白返回空 vec）→ None
+        // 防御：即便 tokenize 给 1 个空 token，cmd 也是空字符串，registry 查表必 miss
+        // 此处接受任一返回，但当前实现按 tokens.is_empty() 判 None
+        let r = ctx("   ");
+        // 不强求 None vs Some("",...,...,0)；但 cmd 必须为空（避免被当作命令名）
+        if let Some((cmd, _, _, _)) = r {
+            assert!(cmd.is_empty(), "cmd must be empty for pure whitespace");
+        }
+    }
+
+    #[test]
+    fn ctx_unclosed_quote_returns_none() {
+        // 未闭合单引号 → tokenize 失败 → None（外层回退到文件名补全的静默路径）
+        assert_eq!(ctx("cat 'unclosed"), None);
+        assert_eq!(ctx("cat \"unclosed"), None);
+    }
+
+    #[test]
+    fn ctx_literal_len_excludes_trailing_whitespace() {
+        // 末尾空白时 literal_len = 0（无论前面 token 多长）
+        let (_, _, _, l) = ctx("git remote ").unwrap();
+        assert_eq!(l, 0);
+        let (_, _, _, l) = ctx("git ").unwrap();
+        assert_eq!(l, 0);
+    }
+
+    #[test]
+    fn ctx_literal_len_counts_trailing_non_ws_bytes() {
+        // 末尾非空白：literal_len = 末尾连续非空白字节数（与 ASCII 字符数一致）
+        let (_, _, _, l) = ctx("git remote set").unwrap();
+        assert_eq!(l, 3); // "set"
+        let (_, _, _, l) = ctx("a bcdef").unwrap();
+        assert_eq!(l, 5); // "bcdef"
     }
 }
