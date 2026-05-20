@@ -147,3 +147,24 @@ pub fn run_cd(err_sink: &mut dyn Write, args: &[String]) {
         }
     }
 }
+
+/// `complete` 内建：本阶段仅识别 `-p <name>` 形态并输出"未注册规格"错误。
+///
+/// bash 真实行为：`complete -p git`（未注册）写入 stderr 的错误格式
+/// `complete: git: no completion specification`，可被 `2>` 重定向到文件——
+/// 故此处错误统一走 `err_sink`，与 `run_type` / `run_cd` 错误信道一致。
+///
+/// 解析规则（精确匹配，不做泛化）：
+/// - `args == ["-p", <name>, ...]` → 向 err_sink 写错误信息（即便后续还有多余参数，
+///   也以第二个 token 作为命令名，与 bash 行为一致：`complete -p git foo` 仍打印 git 行）。
+/// - 其他形态（无参 / 仅 `-p` / 其他 flag / 单个非 flag 参数）：本阶段题目未规定，
+///   静默 `Ok(())` 返回，避免污染 codecrafters 后续阶段预期输出。规格存储与
+///   `complete -C` 注册等能力留待后续阶段。
+pub fn run_complete(err_sink: &mut dyn Write, args: &[String]) -> io::Result<()> {
+    if args.first().map(|s| s.as_str()) == Some("-p") {
+        if let Some(name) = args.get(1) {
+            return writeln!(err_sink, "complete: {}: no completion specification", name);
+        }
+    }
+    Ok(())
+}

@@ -6,7 +6,7 @@ mod exec;
 mod parser;
 mod redirect;
 
-use builtins::{run_cd, run_echo, run_pwd, run_type};
+use builtins::{run_cd, run_complete, run_echo, run_pwd, run_type};
 use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
@@ -126,6 +126,11 @@ fn main() {
             }
             "type" => {
                 if let Err(e) = run_type(&mut *sink, &mut *err_sink, args) {
+                    eprintln!("shell: write error: {}", e);
+                }
+            }
+            "complete" => {
+                if let Err(e) = run_complete(&mut *err_sink, args) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
