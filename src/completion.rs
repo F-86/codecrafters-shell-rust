@@ -26,6 +26,11 @@
 //! - **状态重置**：候选数变为 0/1、LCP 扩展成功、或前缀与上次记忆不同（用户在两次
 //!   TAB 间敲了字符）→ 清 `last_tab_prefix`，下次多候选重新进入"首次响铃"。
 //!
+//! 命令级脚本分支（`complete -C` 注册）独立承载第三套双 TAB 状态机：
+//! `last_tab_script_key` 以 `(cmd, current_word, prev_word)` 三元组为 key，与命令名 /
+//! 文件名两个分支并列、互斥清空。多候选**不做 LCP 扩展**（题目本 stage 明确要求），
+//! 严格遵循「首次 TAB 响铃，二次 TAB 列出 + 重画提示符」的三态语义。
+//!
 //! LCP 算法：候选已字典序排序后，**首末两项的公共前缀 == 全集 LCP**（介于首末之间
 //! 的串其各位置字符必落于首末项相应位置之间或相等，故全集 LCP 与首末项 LCP 相等）。
 //! O(n + L) 优于朴素 O(n·L)。
@@ -77,6 +82,16 @@ pub struct ShellHelper {
     /// 与在参数按 TAB 互不影响节奏。任一分支返回路径都会清掉对侧字段，
     /// 避免「先在命令名 BEL 一次→切到参数立即列出」之类的污染。
     last_tab_arg_key: Cell<Option<(String, String)>>,
+    /// 命令级脚本分支双 TAB 状态机的「上次 TAB 时的 (cmd, current_word, prev_word) 三元组」。
+    ///
+    /// 与命令名分支 `last_tab_prefix`、文件名分支 `last_tab_arg_key` **三者并列、互斥清空**：
+    /// 三个分支语义独立（命令名 / 文件名 / 命令级脚本），不共用 key 以避免「在脚本路径
+    /// BEL 一次→切到命令名直接列出」之类的污染。任一分支被触发即清掉对侧两套字段。
+    ///
+    /// key 选三元组而非 `line[..pos]`：候选完全由脚本驱动，三元组捕获了「脚本 argv
+    /// 输入快照」，跨「相同 argv 但 line 字面不同（多空白等）」也能正确合并节奏。
+    /// `literal_len` 不入 key —— 它仅用于决定 replacement 起点，不影响候选集合。
+    last_tab_script_key: Cell<Option<(String, String, String)>>,
     /// `complete -C <path> <cmd>` 注册的补全脚本表的只读共享句柄。
     ///
     /// 与 `main.rs` 的 dispatch 写端共享同一份 `Rc`：写端在 `complete -C` 命令时
@@ -93,6 +108,7 @@ impl ShellHelper {
             path_executables: list_path_executables(),
             last_tab_prefix: Cell::new(None),
             last_tab_arg_key: Cell::new(None),
+            last_tab_script_key: Cell::new(None),
             completions,
         }
     }
@@ -119,6 +135,10 @@ impl ShellHelper {
         line: &str,
         pos: usize,
     ) -> Result<(usize, Vec<Pair>)> {
+        // 文件名分支被触发：脚本分支双 TAB 节奏作废（与「任一分支被触发即清掉对侧
+        // 两套字段」纪律一致；`last_tab_prefix` 在下面候选分支前的统一出口处清）。
+        self.last_tab_script_key.set(None);
+
         let line_to_pos = &line[..pos];
 
         // 1. 提取前缀；tokenize 失败 → 静默 no-op。空 prefix（末尾空白）是合法输入：
@@ -301,17 +321,48 @@ impl Completer for ShellHelper {
                     line,
                     pos,
                 ) {
-                    Some(text) => {
-                        // 替换 [start, pos) 区段为 `<text> `；rustyline 会把光标停在
-                        // start + replacement.len()，正好得到 `<前缀><text><空格>|`。
+                    Some(mut names) if names.len() == 1 => {
+                        // 单候选：保留上 stage 行为——替换 [start, pos) 为 `<text> `；
+                        // 该轮节奏终结，清掉脚本分支双 TAB 状态机
+                        self.last_tab_script_key.set(None);
+                        let text = names.pop().unwrap();
                         let pair = Pair {
                             display: text.clone(),
                             replacement: format!("{} ", text),
                         };
                         Ok((start, vec![pair]))
                     }
-                    // 脚本异常：静默 no-op（不响铃、不回退、不报错）
-                    None => Ok((pos, Vec::new())),
+                    Some(mut names) => {
+                        // 多候选（≥2）：按字母序排序后进入双 TAB 状态机；
+                        // **本 stage 不做 LCP 扩展**（题目 Notes 明确）
+                        names.sort();
+                        let current_key = (
+                            ctx.cmd.clone(),
+                            ctx.current_word.clone(),
+                            ctx.prev_word.clone(),
+                        );
+                        let prev = self.last_tab_script_key.take();
+                        let same_as_prev = prev.as_ref() == Some(&current_key);
+                        if same_as_prev {
+                            // 二次 TAB：列出 + 重画提示符；状态机已由 take() 清空
+                            // 重画整段 line[..pos]（命令名 + 已输入参数），与文件名分支一致
+                            let joined = names.join("  ");
+                            print!("\n{}\n$ {}", joined, &line[..pos]);
+                            let _ = io::stdout().flush();
+                        } else {
+                            // 首次 TAB（或 key 变化的新一轮）：BEL + 记忆当前 key
+                            print!("\x07");
+                            let _ = io::stdout().flush();
+                            self.last_tab_script_key.set(Some(current_key));
+                        }
+                        // 不让 rustyline 触碰 line buffer
+                        Ok((pos, Vec::new()))
+                    }
+                    // 脚本异常 / 零候选：静默 no-op + 清状态（防"脚本时灵时不灵"残留节奏）
+                    None => {
+                        self.last_tab_script_key.set(None);
+                        Ok((pos, Vec::new()))
+                    }
                 };
             }
             // ctx 提取失败（tokenize 错）：回退既有文件名补全（其内部按未闭合引号
@@ -319,8 +370,9 @@ impl Completer for ShellHelper {
             return self.complete_filename_arg(line, pos);
         }
 
-        // 命令名分支被触发：参数分支的双 TAB 节奏作废，清掉对侧状态。
+        // 命令名分支被触发：参数分支与脚本分支的双 TAB 节奏作废，清掉对侧两套状态。
         self.last_tab_arg_key.set(None);
+        self.last_tab_script_key.set(None);
 
         // 阶段 1：收集去重后的候选名（builtin 优先，PATH 内部及与 builtin 同名均跳过）
         let mut names: Vec<String> = Vec::new();
@@ -640,9 +692,35 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
     })
 }
 
-/// 执行已注册的补全脚本，返回 stdout 首行作为单候选；任何异常返回 `None`。
+/// 解析补全脚本 stdout 为候选列表（纯函数，便于单测）。
 ///
-/// argv 契约（按本 stage 题面）：argv[1]=cmd, argv[2]=current_word, argv[3]=prev_word。
+/// 切分规则：
+/// - 按 `\n` 切分每一行；
+/// - 每行 `trim_end_matches('\r')` 容忍 CRLF 行结束；
+/// - 过滤空行（含纯空白？此处与 bash `complete -C` 对齐：仅按字面空字符串过滤；
+///   `   ` 这类纯空白行作为合法候选保留——若 tester 要求过滤再调整。当前实现
+///   只过滤 `is_empty()`，等价"空行=无效候选"，与 bash 行为一致）；
+/// - 零有效候选 → `None`（与脚本失败统一映射，调用方按"静默 no-op"契约处理）。
+///
+/// **不**做排序：候选顺序由调用方按需决定（多候选展示前会显式 sort）。
+fn parse_completer_stdout(stdout: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for line in stdout.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if !line.is_empty() {
+            out.push(line.to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 执行已注册的补全脚本，返回 stdout 解析后的全部候选；任何异常返回 `None`。
+///
+/// argv 契约（按 stage 题面）：argv[1]=cmd, argv[2]=current_word, argv[3]=prev_word。
 /// 三参数总是同时传递；prev_word 不存在时调用方传空串（脚本仍能 `argv[3]` 取到）。
 ///
 /// env 契约（与 bash `complete -C` 对齐）：
@@ -660,13 +738,12 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
 /// - spawn 失败（路径不存在 / 权限 / non-executable）→ None
 /// - 子进程非零退出 → None（即便 stdout 有内容也丢弃）
 /// - stdout 非 UTF-8 → None
-/// - stdout 首行为空（脚本只 print 了换行）→ None
-/// - 否则 → Some(first_line)，自动 trim 尾随 `\r`（兼容 CRLF 行结束）
+/// - stdout 零有效行（脚本只 print 了换行 / 空内容）→ None
+/// - 否则 → Some(vec)，按 stdout 行序保留（不排序，由调用方处理）
 ///
 /// 实现说明：
 /// - `Command::output()` 内置 wait + 一次性收齐 stdout/stderr，避开题目 Notes 强调的
 ///   「读到部分输出」陷阱；不需要额外 wait/read 配对。
-/// - 多行输出按既定容差："严格遵循题目"只取首行；超出首行的内容静默丢弃。
 fn run_completer_script(
     path: &str,
     cmd: &str,
@@ -674,7 +751,7 @@ fn run_completer_script(
     prev_word: &str,
     comp_line: &str,
     comp_point: usize,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let output = Command::new(path)
         .arg(cmd)
         .arg(current_word)
@@ -687,15 +764,7 @@ fn run_completer_script(
         return None;
     }
     let stdout = std::str::from_utf8(&output.stdout).ok()?;
-    // 取首行（按 '\n' 切分；若整段不含 '\n' 则 first 即整段）
-    let first = stdout.split('\n').next()?;
-    // 容忍 CRLF：trim 尾随 '\r'
-    let first = first.trim_end_matches('\r');
-    if first.is_empty() {
-        None
-    } else {
-        Some(first.to_string())
-    }
+    parse_completer_stdout(stdout)
 }
 
 #[cfg(test)]
@@ -1068,5 +1137,76 @@ mod tests {
         assert_eq!(l, 3); // "set"
         let (_, _, _, l) = ctx("a bcdef").unwrap();
         assert_eq!(l, 5); // "bcdef"
+    }
+
+    // ---- parse_completer_stdout：多候选解析纯函数 ----
+    use super::parse_completer_stdout as parse;
+
+    #[test]
+    fn parse_single_line_no_trailing_newline() {
+        // 脚本只输出一行、无尾换行：单候选
+        assert_eq!(parse("add"), Some(vec!["add".to_string()]));
+    }
+
+    #[test]
+    fn parse_single_line_with_trailing_newline() {
+        // 脚本以 `println!` 风格输出（带尾 `\n`）：仍是单候选，尾空行被过滤
+        assert_eq!(parse("add\n"), Some(vec!["add".to_string()]));
+    }
+
+    #[test]
+    fn parse_multi_lines_lf() {
+        // 题目主例：三候选 LF 分隔 + 尾换行
+        assert_eq!(
+            parse("add\ncommit\npush\n"),
+            Some(vec![
+                "add".to_string(),
+                "commit".to_string(),
+                "push".to_string()
+            ])
+        );
+        // 不带尾换行同样正确
+        assert_eq!(
+            parse("add\ncommit\npush"),
+            Some(vec![
+                "add".to_string(),
+                "commit".to_string(),
+                "push".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_multi_lines_crlf() {
+        // CRLF 行结束：每行尾 `\r` 被 trim 掉
+        assert_eq!(
+            parse("add\r\ncommit\r\npush\r\n"),
+            Some(vec![
+                "add".to_string(),
+                "commit".to_string(),
+                "push".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_filters_empty_lines() {
+        // 中间与首尾空行（含 CR 残留）一并过滤
+        assert_eq!(
+            parse("\nadd\n\ncommit\n\r\npush\n\n"),
+            Some(vec![
+                "add".to_string(),
+                "commit".to_string(),
+                "push".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_all_empty_returns_none() {
+        // 全空 / 仅换行 / 仅 CRLF → None（与脚本失败统一映射）
+        assert_eq!(parse(""), None);
+        assert_eq!(parse("\n"), None);
+        assert_eq!(parse("\r\n\r\n"), None);
     }
 }
