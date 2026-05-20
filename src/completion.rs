@@ -298,6 +298,8 @@ impl Completer for ShellHelper {
                     &ctx.cmd,
                     &ctx.current_word,
                     &ctx.prev_word,
+                    line,
+                    pos,
                 ) {
                     Some(text) => {
                         // 替换 [start, pos) 区段为 `<text> `；rustyline 会把光标停在
@@ -643,7 +645,18 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
 /// argv 契约（按本 stage 题面）：argv[1]=cmd, argv[2]=current_word, argv[3]=prev_word。
 /// 三参数总是同时传递；prev_word 不存在时调用方传空串（脚本仍能 `argv[3]` 取到）。
 ///
-/// 失败契约（按用户决策 4：脚本异常一律静默 no-op）：
+/// env 契约（与 bash `complete -C` 对齐）：
+/// - `COMP_LINE`  = 调用瞬间的整行命令字面（无尾随换行）。**注意取整行 `line`** 而
+///   非 `line[..pos]`：bash 真实语义是整行，光标位置由 `COMP_POINT` 单独标记；
+///   tester 当前用例光标在末尾时两者值相同，但取整行更鲁棒。
+/// - `COMP_POINT` = 光标在 `COMP_LINE` 中的零基**字节**索引（rustyline 的 `pos`
+///   本身已是 byte index，直接 to_string 即可；与 char index 在 ASCII 下等价、在
+///   非 ASCII 下严格按 bash byte-index 语义）。
+/// - 仅子进程可见：使用 `Command::env(K, V)` 链式追加，不调用 `std::env::set_var`，
+///   shell 自身环境不受影响。其余父进程 env（PATH 等）由 `Command` 默认继承，
+///   保证 `#!/usr/bin/env python3` 等 shebang 能正常解析。
+///
+/// 失败契约（脚本异常一律静默 no-op）：
 /// - spawn 失败（路径不存在 / 权限 / non-executable）→ None
 /// - 子进程非零退出 → None（即便 stdout 有内容也丢弃）
 /// - stdout 非 UTF-8 → None
@@ -653,19 +666,21 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
 /// 实现说明：
 /// - `Command::output()` 内置 wait + 一次性收齐 stdout/stderr，避开题目 Notes 强调的
 ///   「读到部分输出」陷阱；不需要额外 wait/read 配对。
-/// - 不向脚本传 stdin / 自定义 env（继承父进程 env 即可支持
-///   `#!/usr/bin/env python3` 等 shebang）。
 /// - 多行输出按既定容差："严格遵循题目"只取首行；超出首行的内容静默丢弃。
 fn run_completer_script(
     path: &str,
     cmd: &str,
     current_word: &str,
     prev_word: &str,
+    comp_line: &str,
+    comp_point: usize,
 ) -> Option<String> {
     let output = Command::new(path)
         .arg(cmd)
         .arg(current_word)
         .arg(prev_word)
+        .env("COMP_LINE", comp_line)
+        .env("COMP_POINT", comp_point.to_string())
         .output()
         .ok()?;
     if !output.status.success() {
