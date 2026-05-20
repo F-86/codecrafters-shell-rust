@@ -1,24 +1,28 @@
 //! 命令行词法分析器（tokenizer）。
 //!
-//! 当前支持单引号与双引号语义：
-//! - 单引号内任何字符（含空格、`$`、`*`、`~`、`"`、Tab 等）按字面量保留；
-//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;` 等）；本阶段
-//!   `$` 与 `\` 暂按字面量处理，留到后续阶段再实现变量展开与反斜杠转义；
+//! 当前支持单引号、双引号与「引号外反斜杠转义」语义：
+//! - 单引号内任何字符（含空格、`$`、`*`、`~`、`"`、`\`、Tab 等）按字面量保留；
+//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;`、`\` 等）；本阶段
+//!   `$` 与 `\` 在双引号内仍按字面量，留到后续阶段再实现变量展开与部分转义；
+//! - 引号外 `\X` 移除 `X` 的特殊含义并按字面量保留 `X`，反斜杠本身被丢弃，
+//!   适用于任意下一字符（含空白、`'`、`"`、`$`、`*` 等及普通字母）；行尾孤立 `\`
+//!   视为语法错误（`TrailingBackslash`）；
 //! - 引号外连续空白作为 token 分隔符并被折叠；
-//! - 任意相邻的引号串 / 空引号 / 裸字符串可无缝拼接成同一个 argument，
-//!   不区分组合方式（双双、双单、单双、双裸、单裸、裸双 …）。
+//! - 任意相邻的引号串 / 空引号 / 裸字符串 / 转义字符可无缝拼接成同一个 argument。
 
 use std::fmt;
 
 /// 词法分析阶段可能产生的错误。
 ///
-/// 保留 enum 形式便于后续阶段（反斜杠转义、变量展开等）扩展。
+/// 保留 enum 形式便于后续阶段（双引号内部分转义、变量展开等）继续扩展。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// 行末仍在单引号内部（缺少闭合 `'`）。
     UnterminatedSingleQuote,
     /// 行末仍在双引号内部（缺少闭合 `"`）。
     UnterminatedDoubleQuote,
+    /// 行末为孤立反斜杠（无字符可转义）。
+    TrailingBackslash,
 }
 
 impl fmt::Display for ParseError {
@@ -29,6 +33,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnterminatedDoubleQuote => {
                 write!(f, "syntax error: unterminated double quote")
+            }
+            ParseError::TrailingBackslash => {
+                write!(f, "syntax error: trailing backslash")
             }
         }
     }
@@ -59,10 +66,25 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
     // `''`、`hello''world`、`'a''b'` 这类相邻拼接，无需特殊分支。
     let mut in_token = false;
     let mut state = State::Normal;
+    // 使用显式迭代器以便 Normal 态遇到 `\` 时主动消费下一字符
+    let mut chars = input.chars();
 
-    for ch in input.chars() {
+    while let Some(ch) = chars.next() {
         match state {
             State::Normal => match ch {
+                '\\' => {
+                    // 引号外反斜杠转义：消费下一字符并按字面量追加；
+                    // 关键：必须置 in_token = true，使 `\<空格>` 不分隔 token、
+                    // 且 `\X` 可独立开启首参数（如 `\_ignored_1`）。
+                    match chars.next() {
+                        Some(c) => {
+                            current.push(c);
+                            in_token = true;
+                        }
+                        // 行尾孤立 `\`：无字符可转义，按语法错误处理
+                        None => return Err(ParseError::TrailingBackslash),
+                    }
+                }
                 '\'' => {
                     // 开启单引号段；标记 token 已开始但不追加引号字符本身
                     state = State::InSingleQuote;
@@ -91,7 +113,7 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     state = State::Normal;
                 }
                 c => {
-                    // 引号内一切字符（含空白与特殊字符）按字面量保留
+                    // 引号内一切字符（含空白与特殊字符，包括 `\`）按字面量保留
                     current.push(c);
                 }
             },
@@ -276,5 +298,92 @@ mod tests {
             tokenize(r#"echo "abc"#),
             Err(ParseError::UnterminatedDoubleQuote)
         );
+    }
+
+    // ===== 引号外反斜杠转义 =====
+
+    #[test]
+    fn escaped_space_keeps_token() {
+        // spec 关键示例：每个 `\ ` 都是字面空格，整体合成单 token
+        assert_eq!(
+            tokenize(r"echo three\ \ \ spaces").unwrap(),
+            vec!["echo", "three   spaces"]
+        );
+        // 测试样例：4 个 `\ ` → 字面 4 空格
+        assert_eq!(
+            tokenize(r"echo multiple\ \ \ \ spaces").unwrap(),
+            vec!["echo", "multiple    spaces"]
+        );
+    }
+
+    #[test]
+    fn escaped_then_unescaped_space_splits() {
+        // `\ ` 保留首个字面空格延续 `before`；随后未转义连续空白折叠为单分隔
+        // tokenize 结果应是两个 arg：`before ` 与 `after`
+        assert_eq!(
+            tokenize(r"echo before\     after").unwrap(),
+            vec!["echo", "before ", "after"]
+        );
+    }
+
+    #[test]
+    fn escaped_letter_drops_backslash() {
+        // `\n` 仅为字面 n，不做 C 风格转义
+        assert_eq!(
+            tokenize(r"echo test\nexample").unwrap(),
+            vec!["echo", "testnexample"]
+        );
+        // `\_` 等普通字符同理
+        assert_eq!(
+            tokenize(r"echo ignore\_backslash").unwrap(),
+            vec!["echo", "ignore_backslash"]
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_yields_single_backslash() {
+        // 第一个 `\` 转义第二个 `\`，结果一个字面反斜杠
+        assert_eq!(
+            tokenize(r"echo hello\\world").unwrap(),
+            vec!["echo", r"hello\world"]
+        );
+    }
+
+    #[test]
+    fn escaped_quotes_are_literal() {
+        // `\'` 与 `\"` 不进入引号态，按字面量
+        assert_eq!(
+            tokenize(r"echo \'hello\'").unwrap(),
+            vec!["echo", "'hello'"]
+        );
+        assert_eq!(
+            tokenize(r#"echo \'\"literal quotes\"\'"#).unwrap(),
+            vec!["echo", r#"'"literal"#, r#"quotes"'"#]
+        );
+    }
+
+    #[test]
+    fn escaped_filenames_for_cat() {
+        // 测试样例：3 个含转义的文件名参数
+        assert_eq!(
+            tokenize(r"cat /tmp/\_ignored_1 /tmp/ignore_\2 /tmp/just_one_\\_3").unwrap(),
+            vec![
+                "cat",
+                "/tmp/_ignored_1",
+                "/tmp/ignore_2",
+                r"/tmp/just_one_\_3",
+            ]
+        );
+    }
+
+    #[test]
+    fn backslash_inside_single_quote_is_literal() {
+        // 守护既有行为：单引号内 `\` 仍按字面量（spec 范围之外）
+        assert_eq!(tokenize(r"'a\b'").unwrap(), vec![r"a\b"]);
+    }
+
+    #[test]
+    fn trailing_backslash_errors() {
+        assert_eq!(tokenize(r"echo abc\"), Err(ParseError::TrailingBackslash));
     }
 }
