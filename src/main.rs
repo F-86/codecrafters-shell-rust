@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -71,28 +71,46 @@ fn run_type(
     }
 }
 
-/// 根据 `stdout_redirect` 准备 sink：
+/// 按重定向语义打开目标文件并返回 [`File`]，供 sink 与外部命令 [`Stdio::from`] 共享：
+/// - `append == true` → `OpenOptions::new().create(true).append(true).open(path)`
+///   （文件不存在则创建；存在则保留原有内容，新写入从末尾追加）。
+/// - `append == false` → `File::create(path)` 等价于 O_WRONLY|O_CREAT|O_TRUNC，
+///   即既有截断重定向行为。
+///
+/// 抽出此 helper 后，`open_sink` / `open_err_sink` 与外部命令分支共享同一打开语义，
+/// 避免「截断 / 追加」逻辑在多个站点重复（防止后续遗漏其中一处导致语义不一致）。
+fn open_file_for_redirect(path: &str, append: bool) -> io::Result<File> {
+    if append {
+        OpenOptions::new().create(true).append(true).open(path)
+    } else {
+        File::create(path)
+    }
+}
+
+/// 根据 `stdout_redirect` 与 `append` 标志准备 sink：
 /// - `None` → 锁定的 stdout 句柄；
-/// - `Some(path)` → `File::create(path)`（不存在则创建、存在则截断覆盖）。
+/// - `Some(path)` + `append=false` → `File::create(path)`（不存在则创建、存在则截断覆盖）；
+/// - `Some(path)` + `append=true`  → `OpenOptions.append(true).create(true).open(path)`。
 ///
 /// 返回 `Box<dyn Write>` 让调用方对两种来源无感；打开失败则把错误反馈给调用方，
 /// 由 REPL 主循环统一打印到 stderr 并跳过本轮命令执行（保证 REPL 不中断）。
-fn open_sink(stdout_redirect: Option<&str>) -> io::Result<Box<dyn Write>> {
+fn open_sink(stdout_redirect: Option<&str>, append: bool) -> io::Result<Box<dyn Write>> {
     match stdout_redirect {
-        Some(path) => Ok(Box::new(File::create(path)?)),
+        Some(path) => Ok(Box::new(open_file_for_redirect(path, append)?)),
         // 注：返回 `io::Stdout` 而非 `StdoutLock<'_>` 以规避借用生命周期约束。
         // 多线程场景下 `Stdout` 内部已有锁，对 REPL 单线程使用场景表现等价。
         None => Ok(Box::new(io::stdout())),
     }
 }
 
-/// 根据 `stderr_redirect` 准备 err_sink，与 [`open_sink`] 完全对称：
+/// 根据 `stderr_redirect` 与 `append` 标志准备 err_sink，与 [`open_sink`] 完全对称：
 /// - `None` → `io::stderr()` 句柄（终端可见，bash 默认行为）；
-/// - `Some(path)` → `File::create(path)`（不存在则创建、存在则截断覆盖，
-///   即使命令未真正写入任何 stderr 文字，文件也已被预先创建为空——与 bash 一致）。
-fn open_err_sink(stderr_redirect: Option<&str>) -> io::Result<Box<dyn Write>> {
+/// - `Some(path)` + `append=false` → `File::create(path)`（截断/创建，即使无 stderr 写入
+///   文件也会被预先创建为空，与 bash 一致）；
+/// - `Some(path)` + `append=true`  → `OpenOptions.append(true).create(true).open(path)`。
+fn open_err_sink(stderr_redirect: Option<&str>, append: bool) -> io::Result<Box<dyn Write>> {
     match stderr_redirect {
-        Some(path) => Ok(Box::new(File::create(path)?)),
+        Some(path) => Ok(Box::new(open_file_for_redirect(path, append)?)),
         None => Ok(Box::new(io::stderr())),
     }
 }
@@ -154,10 +172,11 @@ fn main() {
             continue;
         }
 
-        // 6. 准备 sink / err_sink：根据 stdout_redirect / stderr_redirect 决定写到
-        //    标准流还是文件。打开失败按错误打印到 stderr 后跳过本轮，REPL 不中断。
+        // 6. 准备 sink / err_sink：根据 stdout_redirect / stderr_redirect 与对应的
+        //    append 标志决定打开方式（截断 vs 追加）。打开失败按错误打印到 stderr 后
+        //    跳过本轮，REPL 不中断。
         let mut sink: Box<dyn Write> =
-            match open_sink(parsed.stdout_redirect.as_deref()) {
+            match open_sink(parsed.stdout_redirect.as_deref(), parsed.stdout_append) {
                 Ok(s) => s,
                 Err(e) => {
                     // path 此处一定存在（None 不会失败）
@@ -167,7 +186,7 @@ fn main() {
                 }
             };
         let mut err_sink: Box<dyn Write> =
-            match open_err_sink(parsed.stderr_redirect.as_deref()) {
+            match open_err_sink(parsed.stderr_redirect.as_deref(), parsed.stderr_append) {
                 Ok(s) => s,
                 Err(e) => {
                     let target = parsed.stderr_redirect.as_deref().unwrap_or("?");
@@ -242,10 +261,16 @@ fn main() {
                     //
                     // sink 走的是 Box<dyn Write> 抽象，运行时无法把它「拆回」具体类型，
                     // 故对外部命令重新从 parsed.{stdout,stderr}_redirect 物化一次 stdio。
-                    // 注：err_sink 已在上面 open_err_sink 阶段创建过文件并截断；这里
-                    // 再 File::create 一次会再次截断为空，对未真正写入的场景结果一致。
+                    // 共享 `open_file_for_redirect` helper 保证此处与 sink 打开模式一致：
+                    // append 标志为 true 时复用 `OpenOptions.append(true)`，文件原有内容
+                    // 保留；为 false 时复用 `File::create`（截断）。
+                    //
+                    // 注：err_sink 已在上面 open_err_sink 阶段打开过同一文件；这里再次
+                    // 打开属同一模式（append/truncate），对 truncate 模式而言是再次 truncate
+                    // 为空（语义不变），对 append 模式而言只是另开一个 fd 共享 O_APPEND
+                    // 语义（内核保证两 fd 写入都原子追加到末尾，不会互相覆盖）。
                     let stdio = match parsed.stdout_redirect.as_deref() {
-                        Some(path) => match File::create(path) {
+                        Some(path) => match open_file_for_redirect(path, parsed.stdout_append) {
                             Ok(f) => Stdio::from(f),
                             Err(e) => {
                                 eprintln!("{}: {}: {}", cmd, path, e);
@@ -255,7 +280,7 @@ fn main() {
                         None => Stdio::inherit(),
                     };
                     let err_stdio = match parsed.stderr_redirect.as_deref() {
-                        Some(path) => match File::create(path) {
+                        Some(path) => match open_file_for_redirect(path, parsed.stderr_append) {
                             Ok(f) => Stdio::from(f),
                             Err(e) => {
                                 eprintln!("{}: {}: {}", cmd, path, e);

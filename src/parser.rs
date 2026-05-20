@@ -13,10 +13,15 @@
 //! - 引号外 `>` 与 `1>` / `2>` 被识别为独立 token：当且仅当 `>` 紧贴在裸字符 `1` 或 `2`
 //!   之后（中间无空白、无引号、无转义）时分别合并为单 token `"1>"` / `"2>"`，其余情形
 //!   `>` 单独成 token；引号内 `>` 仍按字面量。
+//! - 引号外连续两个 `>` 紧贴时合并为追加重定向操作符：`">>"` / `"1>>"` / `"2>>"`。
+//!   合并要求两个 `>` 之间无空白、无引号、无转义；引号内 `>>` 仍按字面量。
 //!
-//! 上层 `parse` 函数在 `tokenize` 输出基础上识别 `>` / `1>` / `2>` 操作符（前两者等价，
-//! 均表示 stdout 重定向；`2>` 表示 stderr 重定向），把其后第一个 token 作为对应目标，
-//! 剩余 token 作为 argv，组装出 [`ParsedCommand`]。
+//! 上层 `parse` 函数在 `tokenize` 输出基础上识别 6 类重定向操作符：
+//! - stdout 截断：`>` / `1>`（等价）
+//! - stdout 追加：`>>` / `1>>`（等价）
+//! - stderr 截断：`2>`
+//! - stderr 追加：`2>>`
+//! 把其后第一个 token 作为对应目标，剩余 token 作为 argv，组装出 [`ParsedCommand`]。
 
 use std::fmt;
 
@@ -31,7 +36,8 @@ pub enum ParseError {
     UnterminatedDoubleQuote,
     /// 行末为孤立反斜杠（无字符可转义）。
     TrailingBackslash,
-    /// `>` / `1>` / `2>` 后没有目标文件 token（例如 `echo hello >`、`ls 2>`）。
+    /// 任一重定向操作符（`>` / `1>` / `2>` / `>>` / `1>>` / `2>>`）后没有目标文件 token，
+    /// 例如 `echo hello >`、`ls 2>`、`echo a >>`。
     MissingRedirectTarget,
 }
 
@@ -110,24 +116,38 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     in_token = true;
                 }
                 '>' => {
-                    // 重定向操作符 `>`：作为独立 token 切出。
-                    // 特例：若当前正在累积的 token 恰好是裸字符 `1` 或 `2`（隐含其与 `>`
-                    // 之间无空白、无引号、无转义——任何此类间隔都会先 flush 出对应
-                    // 数字 token 或在 current 中混入其他字符，使 `current != "1"` 且
-                    // `current != "2"`），则把 token 升级为 `"1>"` / `"2>"`，与 bash 的
-                    // `1>` / `2>` 重定向语义对齐。其余情况下，先 flush 当前 token（若有），
-                    // 再单独 push `">"` 作为操作符 token。
+                    // 重定向操作符 `>` / `>>`：作为独立 token 切出。
+                    //
+                    // 第一步：peek 下一字符以判定是否为 `>>` 追加形式。
+                    // `Chars::clone()` 在 std 中是 O(1)（仅克隆 &[u8] 迭代器内部指针），
+                    // 故 peek 不影响词法分析整体复杂度。若下一字符也是 `>`，则消费它
+                    // 并产出 `">>"` 系列 token；否则按既有 `>` 系列产出。
+                    //
+                    // 第二步：根据当前累积 token 是否恰好为裸字符 `"1"` / `"2"` 决定
+                    // 是否合并为 `"1>"` / `"2>"` / `"1>>"` / `"2>>"`——`1` / `2` 与 `>` 之间
+                    // 任何空白、引号、转义都会先 flush 出 current 或改变其值，使合并
+                    // 条件天然不满足。
+                    let is_append = matches!(chars.clone().next(), Some('>'));
+                    if is_append {
+                        chars.next(); // 消费第二个 `>`
+                    }
+                    let (op_one, op_two) = if is_append {
+                        ("1>>", "2>>")
+                    } else {
+                        ("1>", "2>")
+                    };
+                    let op_plain = if is_append { ">>" } else { ">" };
                     if in_token && current == "1" {
                         current.clear();
-                        tokens.push("1>".to_string());
+                        tokens.push(op_one.to_string());
                     } else if in_token && current == "2" {
                         current.clear();
-                        tokens.push("2>".to_string());
+                        tokens.push(op_two.to_string());
                     } else if in_token {
                         tokens.push(std::mem::take(&mut current));
-                        tokens.push(">".to_string());
+                        tokens.push(op_plain.to_string());
                     } else {
-                        tokens.push(">".to_string());
+                        tokens.push(op_plain.to_string());
                     }
                     in_token = false;
                 }
@@ -202,58 +222,90 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
     Ok(tokens)
 }
 
-/// 结构化的一条命令：去除重定向元信息后的 argv，加上可选的 stdout / stderr 重定向目标。
+/// 结构化的一条命令：去除重定向元信息后的 argv，加上可选的 stdout / stderr 重定向目标
+/// 及对应的「截断 / 追加」模式标志。
 ///
-/// 当前阶段支持 stdout（`>` / `1>`）与 stderr（`2>`）重定向；后续阶段可在此扩展追加 /
-/// stdin 等字段而不需调整 [`tokenize`] 与上层 REPL 的契约。
+/// 当前阶段支持 stdout（`>` / `1>` / `>>` / `1>>`）与 stderr（`2>` / `2>>`）重定向；
+/// 后续阶段可在此扩展 stdin 等字段而不需调整 [`tokenize`] 与上层 REPL 的契约。
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedCommand {
     /// 命令名 + 参数（不含任何重定向操作符或目标文件 token）。
     /// 当输入是仅含空白或仅含重定向（如 `> out`）时，`argv` 可能为空——由上层 REPL 决定如何处理。
     pub argv: Vec<String>,
     /// stdout 重定向目标文件路径；`None` 表示未指定重定向。
-    /// `>` 与 `1>` 完全等价，归一化在本函数内完成。
+    /// `>` / `1>` / `>>` / `1>>` 都填这一字段；模式由 `stdout_append` 区分。
     pub stdout_redirect: Option<String>,
-    /// stderr 重定向目标文件路径（`2>` 操作符）；`None` 表示未指定。
-    /// 与 stdout_redirect 完全独立：一行中可同时出现 `> out 2> err`，互不干扰。
+    /// stdout 追加模式标志：`true` 表示用 `>>` / `1>>`（追加打开）；`false` 表示用 `>` / `1>`
+    /// （截断打开）或未指定重定向。`stdout_redirect == None` 时该字段无意义，固定为 `false`。
+    pub stdout_append: bool,
+    /// stderr 重定向目标文件路径（`2>` / `2>>` 操作符）；`None` 表示未指定。
+    /// 与 stdout_redirect 完全独立：一行中可同时出现 `> out 2>> err`，互不干扰。
     pub stderr_redirect: Option<String>,
+    /// stderr 追加模式标志：`true` 表示用 `2>>`；`false` 表示用 `2>` 或未指定重定向。
+    /// `stderr_redirect == None` 时该字段无意义，固定为 `false`。
+    pub stderr_append: bool,
 }
 
 /// 把一行输入解析为 [`ParsedCommand`]。
 ///
-/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再单次线性扫描识别 `>` / `1>` / `2>`：
-/// 把紧随其后的 token 作为对应 `stdout_redirect` / `stderr_redirect`，其余按顺序追加进 `argv`。
+/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再单次线性扫描识别 6 类重定向操作符：
+/// `>` / `1>` / `>>` / `1>>`（stdout）与 `2>` / `2>>`（stderr）。把紧随其后的 token
+/// 作为对应 `*_redirect` 字段，并按操作符是否含 `>>` 设置 `*_append` 标志。
 ///
 /// 错误传播：tokenize 阶段的语法错误原样返回；若任一重定向操作符后无下一 token，
-/// 返回 [`ParseError::MissingRedirectTarget`]。重复出现的同向重定向（如 `> a > b`、
-/// `2> e1 2> e2`）取**最后一次**为准，与 bash 行为一致（前面的目标文件依然被创建/截断，
-/// 但本阶段 spec 不要求该副作用，故仅记录最后一次即可）。
+/// 返回 [`ParseError::MissingRedirectTarget`]。重复 / 混用同向重定向（如 `> a >> b`、
+/// `>> a > b`、`2> e1 2>> e2`）取**最后一次**为准——append 标志也跟随最后一次的操作符
+/// 形式更新，与 bash 行为一致。
 pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
     let tokens = tokenize(input)?;
     let mut argv: Vec<String> = Vec::with_capacity(tokens.len());
     let mut stdout_redirect: Option<String> = None;
+    let mut stdout_append = false;
     let mut stderr_redirect: Option<String> = None;
+    let mut stderr_append = false;
     let mut iter = tokens.into_iter();
     while let Some(tok) = iter.next() {
-        // 归一化：`>` 与 `1>` 都识别为 stdout 重定向；`2>` 识别为 stderr 重定向
-        if tok == ">" || tok == "1>" {
-            match iter.next() {
-                Some(target) => stdout_redirect = Some(target),
+        // 归一化：`>` / `1>` 截断 stdout；`>>` / `1>>` 追加 stdout；
+        //         `2>` 截断 stderr；`2>>` 追加 stderr。
+        // 重复出现取最后一次（含 append 标志），与 bash 一致。
+        match tok.as_str() {
+            ">" | "1>" => match iter.next() {
+                Some(target) => {
+                    stdout_redirect = Some(target);
+                    stdout_append = false;
+                }
                 None => return Err(ParseError::MissingRedirectTarget),
-            }
-        } else if tok == "2>" {
-            match iter.next() {
-                Some(target) => stderr_redirect = Some(target),
+            },
+            ">>" | "1>>" => match iter.next() {
+                Some(target) => {
+                    stdout_redirect = Some(target);
+                    stdout_append = true;
+                }
                 None => return Err(ParseError::MissingRedirectTarget),
-            }
-        } else {
-            argv.push(tok);
+            },
+            "2>" => match iter.next() {
+                Some(target) => {
+                    stderr_redirect = Some(target);
+                    stderr_append = false;
+                }
+                None => return Err(ParseError::MissingRedirectTarget),
+            },
+            "2>>" => match iter.next() {
+                Some(target) => {
+                    stderr_redirect = Some(target);
+                    stderr_append = true;
+                }
+                None => return Err(ParseError::MissingRedirectTarget),
+            },
+            _ => argv.push(tok),
         }
     }
     Ok(ParsedCommand {
         argv,
         stdout_redirect,
+        stdout_append,
         stderr_redirect,
+        stderr_append,
     })
 }
 
@@ -852,5 +904,167 @@ mod tests {
         let p = parse(r#"ls nodir 2> "/tmp/err log.md""#).unwrap();
         assert_eq!(p.argv, vec!["ls", "nodir"]);
         assert_eq!(p.stderr_redirect, Some("/tmp/err log.md".to_string()));
+    }
+
+    // ===== `>>` / `1>>` / `2>>` 追加重定向：tokenize 层 =====
+    // 目的：确认 `>>` 仅在两个 `>` 紧贴（无空白/引号/转义间隔）时合并；
+    //       与 `1` / `2` 紧贴时再分别升级为 `1>>` / `2>>`；引号内 / 转义后仍按字面量。
+
+    #[test]
+    fn redirect_append_plain_merges_only_adjacent_gt() {
+        // 紧贴两个 `>` → 合并为 `>>` 单 token
+        assert_eq!(
+            tokenize("echo hi >> out").unwrap(),
+            vec!["echo", "hi", ">>", "out"]
+        );
+        // 紧贴目标（无空格）：`>>out` 仍正确切出 `>>` 与目标
+        assert_eq!(
+            tokenize("echo hi >>out").unwrap(),
+            vec!["echo", "hi", ">>", "out"]
+        );
+        // 关键负样例：两个 `>` 之间有空格 → 不合并，应是两个独立 `>` 操作符
+        assert_eq!(
+            tokenize("echo hi > > out").unwrap(),
+            vec!["echo", "hi", ">", ">", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_append_with_digit_prefix_merges() {
+        // `1>>` 合并：紧贴 `1` 与连续 `>>`
+        assert_eq!(
+            tokenize("echo hi 1>> out").unwrap(),
+            vec!["echo", "hi", "1>>", "out"]
+        );
+        assert_eq!(
+            tokenize("echo hi 1>>out").unwrap(),
+            vec!["echo", "hi", "1>>", "out"]
+        );
+        // `2>>` 合并
+        assert_eq!(
+            tokenize("ls nodir 2>> err").unwrap(),
+            vec!["ls", "nodir", "2>>", "err"]
+        );
+        assert_eq!(
+            tokenize("ls nodir 2>>err").unwrap(),
+            vec!["ls", "nodir", "2>>", "err"]
+        );
+        // 关键负样例：`1` 与 `>>` 之间有空格 → `1` 是普通 arg，`>>` 独立成操作符
+        assert_eq!(
+            tokenize("echo hi 1 >> out").unwrap(),
+            vec!["echo", "hi", "1", ">>", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_append_inside_quotes_is_literal() {
+        // 单引号内 `>>` 是字面量
+        assert_eq!(
+            tokenize("echo '>> not redirect'").unwrap(),
+            vec!["echo", ">> not redirect"]
+        );
+        // 双引号内 `1>>` 是字面量
+        assert_eq!(
+            tokenize(r#"echo "x 1>> y""#).unwrap(),
+            vec!["echo", "x 1>> y"]
+        );
+    }
+
+    #[test]
+    fn redirect_append_escaped_breaks_merge() {
+        // 第一个 `>` 后紧跟 `\>`：转义切断合并——首 `>` 单独成 token，
+        // 然后 `\>` 在 Normal 态被转义为字面量 `>`，与下一字符拼接为字符串 token。
+        // 当前累积 token 为空，故首 `>` 作为独立操作符 token push。
+        assert_eq!(
+            tokenize(r"echo hi >\>out").unwrap(),
+            vec!["echo", "hi", ">", ">out"]
+        );
+    }
+
+    // ===== `>>` / `1>>` / `2>>` 追加重定向：parse 层 =====
+
+    #[test]
+    fn parse_append_sets_stdout_append_flag() {
+        // `>>` 与 `1>>` 都填 stdout_redirect 并置 stdout_append=true
+        let p = parse("echo first >> out.txt").unwrap();
+        assert_eq!(p.argv, vec!["echo", "first"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert!(p.stdout_append);
+        assert_eq!(p.stderr_redirect, None);
+        assert!(!p.stderr_append);
+
+        let p = parse("echo first 1>> out.txt").unwrap();
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert!(p.stdout_append);
+    }
+
+    #[test]
+    fn parse_append_stderr_sets_flag() {
+        // `2>>` 填 stderr_redirect 并置 stderr_append=true
+        let p = parse("ls nodir 2>> err.txt").unwrap();
+        assert_eq!(p.argv, vec!["ls", "nodir"]);
+        assert_eq!(p.stderr_redirect, Some("err.txt".to_string()));
+        assert!(p.stderr_append);
+        assert_eq!(p.stdout_redirect, None);
+        assert!(!p.stdout_append);
+    }
+
+    #[test]
+    fn parse_truncate_keeps_append_false() {
+        // 既有 `>` / `1>` / `2>` 路径 append 标志保持 false（回归保护）
+        let p = parse("echo hi > out.txt").unwrap();
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert!(!p.stdout_append);
+
+        let p = parse("ls nodir 2> err.txt").unwrap();
+        assert_eq!(p.stderr_redirect, Some("err.txt".to_string()));
+        assert!(!p.stderr_append);
+    }
+
+    #[test]
+    fn parse_mixed_truncate_and_append_takes_last() {
+        // `> a >> b`：最后一次是 `>>`，最终 append=true，目标 b
+        let p = parse("cmd > a >> b").unwrap();
+        assert_eq!(p.argv, vec!["cmd"]);
+        assert_eq!(p.stdout_redirect, Some("b".to_string()));
+        assert!(p.stdout_append);
+
+        // `>> a > b`：最后一次是 `>`，最终 append=false，目标 b
+        let p = parse("cmd >> a > b").unwrap();
+        assert_eq!(p.stdout_redirect, Some("b".to_string()));
+        assert!(!p.stdout_append);
+
+        // stderr 同理：`2> a 2>> b` 最终 append=true
+        let p = parse("cmd 2> a 2>> b").unwrap();
+        assert_eq!(p.stderr_redirect, Some("b".to_string()));
+        assert!(p.stderr_append);
+    }
+
+    #[test]
+    fn parse_stdout_append_and_stderr_append_coexist() {
+        // `>> out 2>> err`：两种追加重定向同时出现，互不干扰
+        let p = parse("cmd a b >> out.txt 2>> err.txt").unwrap();
+        assert_eq!(p.argv, vec!["cmd", "a", "b"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert!(p.stdout_append);
+        assert_eq!(p.stderr_redirect, Some("err.txt".to_string()));
+        assert!(p.stderr_append);
+    }
+
+    #[test]
+    fn parse_append_missing_target_errors() {
+        // `>>` / `1>>` / `2>>` 后无 token → 报 MissingRedirectTarget
+        assert_eq!(
+            parse("echo hi >>"),
+            Err(ParseError::MissingRedirectTarget)
+        );
+        assert_eq!(
+            parse("echo hi 1>>"),
+            Err(ParseError::MissingRedirectTarget)
+        );
+        assert_eq!(
+            parse("ls nodir 2>>"),
+            Err(ParseError::MissingRedirectTarget)
+        );
     }
 }
