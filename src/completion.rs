@@ -260,26 +260,30 @@ impl Completer for ShellHelper {
             // registry 查询：先用 `borrow()` 取出后 `cloned()` 立即释放借用，再 spawn 子进程
             // （避免 Command::output() 阻塞期间持续持有 RefCell 借用）。
             //
-            // 行为分支（按用户决策）：
+            // 行为分支：
             // - ctx 命中 + registry 命中 + 脚本成功 → 单候选替换 `[pos - literal_len, pos)`
             //   区段为 `<text> `；literal_len = 0 时退化为纯插入（与上 stage 等价）
             // - ctx 命中 + registry 命中 + 脚本失败/空 → 静默 no-op，line 不变
-            //   （决策 4：脚本失败不响铃、不回退到文件名补全）
-            // - ctx 命中 + registry 未命中 → 静默 no-op（决策 5：与 bash `complete -C`
-            //   严格语义对齐，未注册命令不再走文件名补全）
+            //   （决策 4：脚本失败不响铃、不回退到文件名补全；避免脚本噪音污染交互）
+            // - ctx 命中 + registry 未命中 → **回退 complete_filename_arg**：保留上一
+            //   stage（Multi-argument completions）已实现的 cwd 文件名补全特性。
+            //   注：这与 bash `complete -C` 的"未注册命令不补全"严格语义略有差异，
+            //   但 codecrafters tester 在更下层的 stage（如 Filename Completion -
+            //   Multi-argument）依赖未注册命令仍走文件名补全，故采用更宽松回退。
             // - ctx 提取失败（tokenize 错）→ 回退 complete_filename_arg
             if let Some(ctx) = extract_completer_context(prefix) {
-                // 命令级分支被触发：清掉对侧双 TAB 状态机
-                self.last_tab_prefix.set(None);
-                self.last_tab_arg_key.set(None);
-
                 let registered: Option<String> =
                     self.completions.borrow().get(&ctx.cmd).cloned();
                 let path = match registered {
                     Some(p) => p,
-                    // registry 未命中：静默 no-op，不回退文件名补全
-                    None => return Ok((pos, Vec::new())),
+                    // registry 未命中：回退文件名补全（保留上 stage 行为）
+                    None => return self.complete_filename_arg(line, pos),
                 };
+
+                // 命令级脚本分支被触发：清掉对侧双 TAB 状态机
+                // （注意：这只能在确定走脚本路径后再清，否则会污染下面 fallback 路径）
+                self.last_tab_prefix.set(None);
+                self.last_tab_arg_key.set(None);
 
                 // 字面对齐校验：literal_len 从 line 反扫得到，理论上严格落在 `line[..pos]`
                 // 区间内，pos - literal_len 不会越界；这里仅做防御性 assert-style 检查，
