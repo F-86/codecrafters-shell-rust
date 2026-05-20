@@ -41,6 +41,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -110,16 +111,24 @@ impl ShellHelper {
             return Ok((pos, Vec::new()));
         }
 
-        // 3. 扫描 cwd 找候选
-        let candidates = match_files_in_cwd(&prefix);
+        // 3. 按最后一个 '/' 切分目录与叶子前缀；不含 '/' 时 dir_part = ""，等价 cwd。
+        let (dir_part, name_prefix) = split_dir_and_name(&prefix);
+        let scan_dir: &Path = if dir_part.is_empty() {
+            Path::new(".")
+        } else {
+            Path::new(dir_part)
+        };
+        let candidates = match_files_in_dir(scan_dir, name_prefix);
 
         // 4. 三态分支
         match candidates.len() {
             1 => {
-                let name = candidates.into_iter().next().unwrap();
+                let entry = candidates.into_iter().next().unwrap();
+                // 拼回 dir_part：dir_part 含尾 '/' 或为空字符串，直接拼接得到完整 token。
+                let full = format!("{}{}", dir_part, entry);
                 let pair = Pair {
-                    display: name.clone(),
-                    replacement: format!("{} ", name),
+                    display: full.clone(),
+                    replacement: format!("{} ", full),
                 };
                 Ok((start, vec![pair]))
             }
@@ -273,23 +282,46 @@ fn extract_arg_prefix(line_to_pos: &str) -> Option<String> {
     tokens.into_iter().last()
 }
 
-/// 扫描当前工作目录，返回所有以 `prefix` 字面开头的 entry 文件名。
+/// 把参数 token 切分为 (dir_part, name_prefix)，供嵌套路径补全使用。
 ///
+/// 切分规则：以 token 中**最后一个 `/`** 为切点；`dir_part` 始终包含尾 `/`。
+/// 不含 `/` 时退化为 `("", token)`，让调用方按 cwd 场景处理（与上 stage 行为字面等价）。
+///
+/// 实现说明：`'/'` 是 ASCII 字节，`rfind('/')` 直接定位字节位置，`split_at` 在
+/// UTF-8 串上按字节切片不会破坏 char 边界。返回 `&str` 切片避免分配。
+///
+/// 例：
+/// - `"f"`         → `("", "f")`
+/// - `"path/to/f"` → `("path/to/", "f")`
+/// - `"path/to/"`  → `("path/to/", "")`
+/// - `"/etc/h"`    → `("/etc/", "h")`
+/// - `""`          → `("", "")`
+fn split_dir_and_name(token: &str) -> (&str, &str) {
+    match token.rfind('/') {
+        Some(idx) => token.split_at(idx + 1),
+        None => ("", token),
+    }
+}
+
+/// 扫描指定目录，返回所有以 `name_prefix` 字面开头的 entry 叶子名（**不含 dir 前缀**）。
+///
+/// - `dir` 由 OS 解析：相对路径相对 cwd，绝对路径直接定位（如 `/etc/`）。
 /// - 不区分 file/dir（本 stage 测试只放普通文件；目录尾随 `/` 留待后续 stage）。
 /// - 隐藏文件天然纳入：`read_dir` 不会自动过滤 `.` 开头条目，且本函数不主动跳过。
-/// - I/O 失败（read_dir 或 DirEntry 解析失败）静默返回空 Vec：补全是交互路径，
-///   写错误日志会污染用户输入区。
-/// - 复杂度 O(N)，N 为 cwd 条目数；TAB 是低频交互，不做缓存。
-fn match_files_in_cwd(prefix: &str) -> Vec<String> {
+/// - I/O 失败（不存在 / 非目录 / 权限 / DirEntry 解析失败）静默返回空 Vec：
+///   补全是交互路径，写错误日志会污染用户输入区。
+/// - 调用方负责拼回 dir 前缀形成完整路径。
+/// - 复杂度 O(N)，N 为目标目录条目数；TAB 是低频交互，不做缓存。
+fn match_files_in_dir(dir: &Path, name_prefix: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let iter = match fs::read_dir(".") {
+    let iter = match fs::read_dir(dir) {
         Ok(it) => it,
         Err(_) => return out,
     };
     for entry in iter.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(prefix) {
+        if name.starts_with(name_prefix) {
             out.push(name.into_owned());
         }
     }
@@ -348,14 +380,14 @@ mod tests {
     #[test]
     fn match_files_finds_unique_prefix() {
         // `Cargo.t` 在本仓库内仅匹配 Cargo.toml
-        let v = super::match_files_in_cwd("Cargo.t");
+        let v = super::match_files_in_dir(std::path::Path::new("."), "Cargo.t");
         assert_eq!(v, vec!["Cargo.toml".to_string()]);
     }
 
     #[test]
     fn match_files_multi_match_returns_all() {
         // `Cargo.` 匹配 Cargo.toml 与 Cargo.lock
-        let mut v = super::match_files_in_cwd("Cargo.");
+        let mut v = super::match_files_in_dir(std::path::Path::new("."), "Cargo.");
         v.sort();
         assert_eq!(
             v,
@@ -365,7 +397,60 @@ mod tests {
 
     #[test]
     fn match_files_no_match_empty() {
-        let v = super::match_files_in_cwd("zzz_no_such_prefix_");
+        let v = super::match_files_in_dir(std::path::Path::new("."), "zzz_no_such_prefix_");
+        assert!(v.is_empty());
+    }
+
+    // ---- split_dir_and_name 边界用例 ----
+    #[test]
+    fn split_no_slash() {
+        assert_eq!(super::split_dir_and_name("f"), ("", "f"));
+    }
+
+    #[test]
+    fn split_empty_token() {
+        assert_eq!(super::split_dir_and_name(""), ("", ""));
+    }
+
+    #[test]
+    fn split_relative_path() {
+        assert_eq!(super::split_dir_and_name("path/to/f"), ("path/to/", "f"));
+    }
+
+    #[test]
+    fn split_trailing_slash() {
+        // 末尾即最后 '/'：name_prefix 为空，dir_part 含尾 '/'
+        assert_eq!(super::split_dir_and_name("path/to/"), ("path/to/", ""));
+    }
+
+    #[test]
+    fn split_absolute_path() {
+        assert_eq!(super::split_dir_and_name("/etc/h"), ("/etc/", "h"));
+    }
+
+    #[test]
+    fn split_multi_level() {
+        assert_eq!(super::split_dir_and_name("a/b/c/d"), ("a/b/c/", "d"));
+    }
+
+    // ---- match_files_in_dir 嵌套目录用例 ----
+    #[test]
+    fn match_files_nested_finds_entry() {
+        // src/ 下确有 completion.rs；前缀 "comp" 应至少命中它
+        let v = super::match_files_in_dir(std::path::Path::new("src"), "comp");
+        assert!(
+            v.iter().any(|n| n == "completion.rs"),
+            "expected completion.rs in {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn match_files_nonexistent_dir_returns_empty() {
+        let v = super::match_files_in_dir(
+            std::path::Path::new("zzz_no_such_dir_xyz_qqq"),
+            "",
+        );
         assert!(v.is_empty());
     }
 }
