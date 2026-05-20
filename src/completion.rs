@@ -647,4 +647,37 @@ mod tests {
         assert_eq!(p.display, "pig/dog/");
         assert_eq!(p.replacement, "pig/dog/");
     }
+
+    // ---- Stage: Completion in Any Argument Position ----
+    // 这四条测试显式锁定 stage 核心断言：
+    //   1) 补全的 prefix 永远是「最后一个 token」，与参数位置（第几个）无关
+    //   2) 前导目录参数（如 `bar/`）不会切换搜索目录——裸名仍扫 CWD
+    #[test]
+    fn extract_prefix_at_third_arg() {
+        // 第 3 个参数位置：tokenize → ["ls", "bar/", "foo", "x"]，last = "x"
+        assert_eq!(
+            extract_arg_prefix("ls bar/ foo x"),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_prefix_after_dir_arg() {
+        // 目录参数后跟空白：等价于"列出当前参数位置的全部 CWD 候选"
+        assert_eq!(extract_arg_prefix("ls bar/ "), Some(String::new()));
+    }
+
+    #[test]
+    fn extract_prefix_subsequent_with_prefix() {
+        // 关键断言：前导目录参数 `bar/` 不会被并入下一个参数的 prefix
+        // 期望 prefix == "f"（而不是 "bar/ f" 或 "bar/f"）
+        assert_eq!(extract_arg_prefix("ls bar/ f"), Some("f".to_string()));
+    }
+
+    #[test]
+    fn split_dir_and_name_isolated_arg() {
+        // 裸名（无 '/'）→ dir_part 为空 → 扫描 CWD
+        // 即使上一个参数是 `bar/`，本参数 `f` 也只在 CWD 匹配，不进 bar/
+        assert_eq!(super::split_dir_and_name("f"), ("", "f"));
+    }
 }

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
-pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd"];
+pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete"];
 
 /// 按 PATH 顺序查找可执行文件。
 /// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
