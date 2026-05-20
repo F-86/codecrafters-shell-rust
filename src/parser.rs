@@ -2,8 +2,9 @@
 //!
 //! 当前支持单引号、双引号与「引号外反斜杠转义」语义：
 //! - 单引号内任何字符（含空格、`$`、`*`、`~`、`"`、`\`、Tab 等）按字面量保留；
-//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;`、`\` 等）；本阶段
-//!   `$` 与 `\` 在双引号内仍按字面量，留到后续阶段再实现变量展开与部分转义；
+//! - 双引号内大部分字符按字面量保留（含空格、单引号、`*`、`;` 等）；`\` 仅对
+//!   `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义并吃掉自身，其他字符前 `\` 按字面量
+//!   保留；`$` 仍按字面量（变量展开留待后续阶段）；
 //! - 引号外 `\X` 移除 `X` 的特殊含义并按字面量保留 `X`，反斜杠本身被丢弃，
 //!   适用于任意下一字符（含空白、`'`、`"`、`$`、`*` 等及普通字母）；行尾孤立 `\`
 //!   视为语法错误（`TrailingBackslash`）；
@@ -49,8 +50,9 @@ enum State {
     Normal,
     /// 单引号内部：任何字符（除 `'`）都按字面量追加。
     InSingleQuote,
-    /// 双引号内部：任何字符（除 `"`）都按字面量追加。
-    /// 注：本阶段 `$` 与 `\` 暂按字面量，后续阶段再做变量展开 / 转义。
+    /// 双引号内部：除 `"` 外大多数字符按字面量追加；`\` 仅对
+    /// `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义（吃掉自身），其他字符前
+    /// `\` 按字面量保留。`$` 仍按字面量，待后续阶段实现变量展开。
     InDoubleQuote,
 }
 
@@ -122,9 +124,29 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     // 闭合引号：回到 Normal；in_token 保持为真支持后续拼接
                     state = State::Normal;
                 }
+                '\\' => {
+                    // 双引号内反斜杠：仅对 `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义
+                    // 并吃掉自身；其他字符前 `\` 按字面量保留（与 Normal 态「无条件
+                    // 转义」的关键差异：双引号内 `\n` 是 2 字符字面量，不丢反斜杠）。
+                    // 注：`\$` 与 `` \` `` 提前到位与 bash 真实行为一致，避免后续
+                    // 变量展开阶段回头改测试。`std::str::Chars` 实现 `Clone`，
+                    // `chars.clone().next()` 是 O(1) 安全 peek。
+                    match chars.clone().next() {
+                        Some(next) if matches!(next, '"' | '\\' | '$' | '`') => {
+                            chars.next(); // 消费下一字符
+                            current.push(next); // 仅 push 下一字符（反斜杠被吃掉）
+                        }
+                        _ => {
+                            // 其他字符或行尾：保留 `\` 字面，不消费下一字符
+                            // （让其在循环正常分支处理）。行尾孤立 `\` + EOF
+                            // 仍由后续 `UnterminatedDoubleQuote` 兜底。
+                            current.push('\\');
+                        }
+                    }
+                }
                 c => {
-                    // 引号内一切字符（含空白、单引号、`$`、`\`、`*`、`;` 等）按字面量保留
-                    // 注：`$` 与 `\` 的特殊语义在后续阶段实现
+                    // 引号内其他字符（含空白、单引号、`$`、`*`、`;` 等）按字面量保留
+                    // 注：`$` 的变量展开语义在后续阶段实现
                     current.push(c);
                 }
             },
@@ -385,5 +407,101 @@ mod tests {
     #[test]
     fn trailing_backslash_errors() {
         assert_eq!(tokenize(r"echo abc\"), Err(ParseError::TrailingBackslash));
+    }
+
+    // ===== 双引号内反斜杠转义 =====
+
+    #[test]
+    fn double_quote_escapes_backslash() {
+        // spec 示例：`"A \\ escapes itself"` → `A \ escapes itself`
+        // 双反斜杠 `\\` 在双引号内被吃掉一个，留下单字面反斜杠
+        assert_eq!(
+            tokenize(r#"echo "A \\ escapes itself""#).unwrap(),
+            vec!["echo", r"A \ escapes itself"]
+        );
+    }
+
+    #[test]
+    fn double_quote_escapes_double_quote() {
+        // spec 示例：`"A \" inside double quotes"` → `A " inside double quotes`
+        // `\"` 在双引号内是字面双引号，不闭合
+        assert_eq!(
+            tokenize(r#"echo "A \" inside double quotes""#).unwrap(),
+            vec!["echo", r#"A " inside double quotes"#]
+        );
+    }
+
+    #[test]
+    fn double_quote_preserves_backslash_before_letter() {
+        // spec 关键示例：`"just'one'\\n'backslash"` → `just'one'\n'backslash`
+        // `\\` → `\`，紧接的 `n` 是字面量；最终是反斜杠+n 两字符，不是换行符
+        assert_eq!(
+            tokenize(r#"echo "just'one'\\n'backslash""#).unwrap(),
+            vec!["echo", r"just'one'\n'backslash"]
+        );
+    }
+
+    #[test]
+    fn double_quote_concatenation_with_escaped_quote() {
+        // spec 关键示例：`"inside\"literal_quote."outside\"` → `inside"literal_quote.outside"`
+        // 三段拼接：双引号段 `inside"literal_quote.` + Normal 续接 `outside` +
+        // 引号外 `\"` 转义为字面 `"`，全程单 token
+        assert_eq!(
+            tokenize(r#""inside\"literal_quote."outside\""#).unwrap(),
+            vec![r#"inside"literal_quote.outside""#]
+        );
+    }
+
+    #[test]
+    fn double_quote_paths_for_cat_with_escapes() {
+        // spec 测试样例：cat 三个含转义的双引号路径
+        assert_eq!(
+            tokenize(r#"cat "/tmp/number 1" "/tmp/doublequote \" 2" "/tmp/backslash \\ 3""#)
+                .unwrap(),
+            vec![
+                "cat",
+                "/tmp/number 1",
+                r#"/tmp/doublequote " 2"#,
+                r"/tmp/backslash \ 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn double_quote_escapes_dollar() {
+        // 提前到位：`\$` 在双引号内吃掉反斜杠，仅留字面 `$`（与 bash 真实行为一致）
+        assert_eq!(
+            tokenize(r#"echo "price \$5""#).unwrap(),
+            vec!["echo", "price $5"]
+        );
+    }
+
+    #[test]
+    fn double_quote_escapes_backtick() {
+        // 提前到位：`` \` `` 在双引号内吃掉反斜杠，仅留字面反引号
+        assert_eq!(
+            tokenize(r#"echo "a \` b""#).unwrap(),
+            vec!["echo", "a ` b"]
+        );
+    }
+
+    #[test]
+    fn double_quote_backslash_before_other_chars_is_literal() {
+        // 反斜杠后跟普通字符（n、a、空格等）时反斜杠按字面量保留
+        assert_eq!(
+            tokenize(r#"echo "\a\b\c""#).unwrap(),
+            vec!["echo", r"\a\b\c"]
+        );
+        // 反斜杠后跟空格也保留（双引号内空格本就是字面量，反斜杠也保留）
+        assert_eq!(
+            tokenize(r#"echo "x\ y""#).unwrap(),
+            vec!["echo", r"x\ y"]
+        );
+    }
+
+    #[test]
+    fn backslash_inside_single_quote_unchanged() {
+        // 回归守护：单引号内反斜杠仍按字面量（spec 范围之外，不应被本阶段改动影响）
+        assert_eq!(tokenize(r"echo 'a\b\\c'").unwrap(), vec!["echo", r"a\b\\c"]);
     }
 }
