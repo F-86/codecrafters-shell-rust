@@ -39,20 +39,25 @@ fn run_echo(sink: &mut dyn Write, args: &[String]) -> io::Result<()> {
 
 /// `pwd` 内建：打印当前工作目录的绝对路径。
 /// `current_dir()` 内部调用 `getcwd(2)`，由 OS 保证返回绝对路径。
-/// 目录被删除 / 无权限等异常场景：错误信息固定写到 stderr（与 bash 一致），不进入 sink。
-fn run_pwd(sink: &mut dyn Write) -> io::Result<()> {
+/// 目录被删除 / 无权限等异常场景：错误信息写入 err_sink，可被 `2>` 重定向到文件。
+fn run_pwd(sink: &mut dyn Write, err_sink: &mut dyn Write) -> io::Result<()> {
     match std::env::current_dir() {
         Ok(path) => writeln!(sink, "{}", path.display()),
         Err(e) => {
-            eprintln!("pwd: {}", e);
-            Ok(())
+            // 写入 err_sink 的失败本身仍 fallback 到顶层 eprintln!，避免双重错误丢失
+            writeln!(err_sink, "pwd: {}", e)
         }
     }
 }
 
 /// `type` 内建：查询目标名是 builtin、PATH 中可执行文件还是 not found。
-/// 三种结果都属于 stdout 输出，统一写入 sink。无参数时静默（与既有行为一致）。
-fn run_type(sink: &mut dyn Write, args: &[String]) -> io::Result<()> {
+/// `builtin` / PATH 命中走 stdout sink；`not found` 走 err_sink（与 bash 行为一致），
+/// 可被 `2>` 重定向到文件。无参数时静默（与既有行为一致）。
+fn run_type(
+    sink: &mut dyn Write,
+    err_sink: &mut dyn Write,
+    args: &[String],
+) -> io::Result<()> {
     let Some(target) = args.first() else {
         return Ok(());
     };
@@ -62,7 +67,7 @@ fn run_type(sink: &mut dyn Write, args: &[String]) -> io::Result<()> {
     } else if let Some(path) = find_in_path(target) {
         writeln!(sink, "{} is {}", target, path.display())
     } else {
-        writeln!(sink, "{}: not found", target)
+        writeln!(err_sink, "{}: not found", target)
     }
 }
 
@@ -78,6 +83,17 @@ fn open_sink(stdout_redirect: Option<&str>) -> io::Result<Box<dyn Write>> {
         // 注：返回 `io::Stdout` 而非 `StdoutLock<'_>` 以规避借用生命周期约束。
         // 多线程场景下 `Stdout` 内部已有锁，对 REPL 单线程使用场景表现等价。
         None => Ok(Box::new(io::stdout())),
+    }
+}
+
+/// 根据 `stderr_redirect` 准备 err_sink，与 [`open_sink`] 完全对称：
+/// - `None` → `io::stderr()` 句柄（终端可见，bash 默认行为）；
+/// - `Some(path)` → `File::create(path)`（不存在则创建、存在则截断覆盖，
+///   即使命令未真正写入任何 stderr 文字，文件也已被预先创建为空——与 bash 一致）。
+fn open_err_sink(stderr_redirect: Option<&str>) -> io::Result<Box<dyn Write>> {
+    match stderr_redirect {
+        Some(path) => Ok(Box::new(File::create(path)?)),
+        None => Ok(Box::new(io::stderr())),
     }
 }
 
@@ -131,18 +147,30 @@ fn main() {
 
         // 极端情况：纯 `''` 这类输入会得到空字符串 cmd，按 not found 处理
         if cmd.is_empty() {
-            println!("{}: command not found", line);
+            // 此处不走 err_sink（line 实际不可能是非空但 cmd 为空的常规命令；
+            // 即便如此，按 bash 行为「command not found」走 stderr，但因为还没
+            // 准备 sink 也无重定向语义关键路径，直接 eprintln! 即可）。
+            eprintln!("{}: command not found", line);
             continue;
         }
 
-        // 6. 准备 sink：根据 stdout_redirect 决定写到 stdout 还是文件。
-        //    打开失败按错误打印到 stderr 后跳过本轮，REPL 不中断。
+        // 6. 准备 sink / err_sink：根据 stdout_redirect / stderr_redirect 决定写到
+        //    标准流还是文件。打开失败按错误打印到 stderr 后跳过本轮，REPL 不中断。
         let mut sink: Box<dyn Write> =
             match open_sink(parsed.stdout_redirect.as_deref()) {
                 Ok(s) => s,
                 Err(e) => {
                     // path 此处一定存在（None 不会失败）
                     let target = parsed.stdout_redirect.as_deref().unwrap_or("?");
+                    eprintln!("{}: {}: {}", cmd, target, e);
+                    continue;
+                }
+            };
+        let mut err_sink: Box<dyn Write> =
+            match open_err_sink(parsed.stderr_redirect.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    let target = parsed.stderr_redirect.as_deref().unwrap_or("?");
                     eprintln!("{}: {}: {}", cmd, target, e);
                     continue;
                 }
@@ -161,7 +189,7 @@ fn main() {
                 }
             }
             "pwd" => {
-                if let Err(e) = run_pwd(&mut *sink) {
+                if let Err(e) = run_pwd(&mut *sink, &mut *err_sink) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
@@ -169,7 +197,7 @@ fn main() {
                 // 取首个参数作为目标路径；支持绝对路径、相对路径（./、../、子目录名）与 ~
                 // 相对路径由内核基于当前进程 cwd 解析，无需在此做字符串展开
                 // 无参数场景本阶段不覆盖，静默跳过
-                // 注：cd 不产 stdout 输出，故不接 sink；错误信息按既有约定打到 stdout
+                // 注：cd 不产 stdout 输出，故不接 sink；错误信息走 err_sink，可被 `2>` 捕获
                 if let Some(target) = args.first() {
                     // ~ 展开：本阶段仅匹配精确 "~"，不处理 ~/subdir 或 ~user 形式
                     // HOME 缺失时按统一错误格式输出，避免 unwrap 导致 REPL 中断
@@ -177,7 +205,11 @@ fn main() {
                         match std::env::var("HOME") {
                             Ok(home) => home,
                             Err(_) => {
-                                println!("cd: {}: No such file or directory", target);
+                                let _ = writeln!(
+                                    &mut *err_sink,
+                                    "cd: {}: No such file or directory",
+                                    target
+                                );
                                 continue;
                             }
                         }
@@ -188,24 +220,30 @@ fn main() {
                     // 不存在 / 非目录 / 无权限等失败统一打印同一错误信息以匹配测试期望
                     // 错误信息回显用户原始输入 target，不展开为 home 路径（与 bash 行为一致）
                     if std::env::set_current_dir(&resolved).is_err() {
-                        println!("cd: {}: No such file or directory", target);
+                        let _ = writeln!(
+                            &mut *err_sink,
+                            "cd: {}: No such file or directory",
+                            target
+                        );
                     }
                 }
             }
             "type" => {
-                if let Err(e) = run_type(&mut *sink, args) {
+                if let Err(e) = run_type(&mut *sink, &mut *err_sink, args) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
             _ => {
                 // 非内建：复用 type 的 PATH 查找，命中即作为外部程序执行
                 if let Some(path) = find_in_path(cmd) {
-                    // 关键：在 spawn 子进程之前**释放** sink 持有的文件 fd 拥有权——
-                    // 重定向时把 File 直接转移给 Command::stdout，由子进程 inherit；
-                    // 无重定向时只需让父进程继承自己的 stdout（默认即 inherit）。
+                    // 关键：在 spawn 子进程之前**释放** sink / err_sink 持有的文件 fd 拥有权——
+                    // 重定向时把 File 直接转移给 Command::stdout / .stderr，由子进程 inherit；
+                    // 无重定向时让父进程继承自己的 stdout / stderr（默认即 inherit）。
                     //
                     // sink 走的是 Box<dyn Write> 抽象，运行时无法把它「拆回」具体类型，
-                    // 故对外部命令重新从 parsed.stdout_redirect 物化一次 stdio：
+                    // 故对外部命令重新从 parsed.{stdout,stderr}_redirect 物化一次 stdio。
+                    // 注：err_sink 已在上面 open_err_sink 阶段创建过文件并截断；这里
+                    // 再 File::create 一次会再次截断为空，对未真正写入的场景结果一致。
                     let stdio = match parsed.stdout_redirect.as_deref() {
                         Some(path) => match File::create(path) {
                             Ok(f) => Stdio::from(f),
@@ -216,23 +254,37 @@ fn main() {
                         },
                         None => Stdio::inherit(),
                     };
-                    // 提前丢弃父进程内 sink 对同一文件的写句柄，避免与子进程 stdout
+                    let err_stdio = match parsed.stderr_redirect.as_deref() {
+                        Some(path) => match File::create(path) {
+                            Ok(f) => Stdio::from(f),
+                            Err(e) => {
+                                eprintln!("{}: {}: {}", cmd, path, e);
+                                continue;
+                            }
+                        },
+                        None => Stdio::inherit(),
+                    };
+                    // 提前丢弃父进程内 sink / err_sink 对同一文件的写句柄，避免与子进程
                     // 的截断/写入产生竞态（虽然内核 fd 独立，但语义上更干净）。
                     drop(sink);
+                    drop(err_sink);
 
                     // argv[0] 必须是用户输入的命令名而非完整路径（与 bash 行为一致）
-                    // stderr 默认继承父进程（即终端），与 spec「错误不重定向」严格对齐
                     let status = Command::new(&path)
                         .arg0(cmd)
                         .args(args)
                         .stdout(stdio)
+                        .stderr(err_stdio)
                         .status();
                     if status.is_err() {
-                        // spawn / wait 失败时降级，避免 REPL 中断
-                        println!("{}: command not found", line);
+                        // spawn / wait 失败时降级，避免 REPL 中断；此时 err_sink 已被
+                        // drop，回退到父进程 stderr（仍可见但不被 `2>` 捕获——属罕见
+                        // 极端情况，可接受的退化语义）。
+                        eprintln!("{}: command not found", line);
                     }
                 } else {
-                    println!("{}: command not found", line);
+                    // 未在 PATH 命中：command not found 走 err_sink（可被 `2>` 捕获）
+                    let _ = writeln!(&mut *err_sink, "{}: command not found", line);
                 }
             }
         }

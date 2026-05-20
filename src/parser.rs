@@ -10,13 +10,13 @@
 //!   视为语法错误（`TrailingBackslash`）；
 //! - 引号外连续空白作为 token 分隔符并被折叠；
 //! - 任意相邻的引号串 / 空引号 / 裸字符串 / 转义字符可无缝拼接成同一个 argument；
-//! - 引号外 `>` 与 `1>` 被识别为独立 token：当且仅当 `>` 紧贴在裸字符 `1` 之后（中间无
-//!   空白、无引号、无转义）时合并为单 token `"1>"`，其余情形 `>` 单独成 token；引号
-//!   内 `>` 仍按字面量。
+//! - 引号外 `>` 与 `1>` / `2>` 被识别为独立 token：当且仅当 `>` 紧贴在裸字符 `1` 或 `2`
+//!   之后（中间无空白、无引号、无转义）时分别合并为单 token `"1>"` / `"2>"`，其余情形
+//!   `>` 单独成 token；引号内 `>` 仍按字面量。
 //!
-//! 上层 `parse` 函数在 `tokenize` 输出基础上识别 `>` / `1>` 操作符（两者等价），
-//! 把其后第一个 token 作为 stdout 重定向目标，剩余 token 作为 argv，组装出
-//! [`ParsedCommand`]。
+//! 上层 `parse` 函数在 `tokenize` 输出基础上识别 `>` / `1>` / `2>` 操作符（前两者等价，
+//! 均表示 stdout 重定向；`2>` 表示 stderr 重定向），把其后第一个 token 作为对应目标，
+//! 剩余 token 作为 argv，组装出 [`ParsedCommand`]。
 
 use std::fmt;
 
@@ -31,7 +31,7 @@ pub enum ParseError {
     UnterminatedDoubleQuote,
     /// 行末为孤立反斜杠（无字符可转义）。
     TrailingBackslash,
-    /// `>` / `1>` 后没有目标文件 token（例如 `echo hello >`）。
+    /// `>` / `1>` / `2>` 后没有目标文件 token（例如 `echo hello >`、`ls 2>`）。
     MissingRedirectTarget,
 }
 
@@ -111,14 +111,18 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                 }
                 '>' => {
                     // 重定向操作符 `>`：作为独立 token 切出。
-                    // 特例：若当前正在累积的 token 恰好是裸字符 `1`（隐含 `1` 与 `>`
-                    // 之间无空白、无引号、无转义——任何此类间隔都会先 flush 出 `1`
-                    // 或在 current 中混入其他字符，使 `current != "1"`），则把 token
-                    // 升级为 `"1>"`，与 bash 的 `1>` 重定向语义对齐。其余情况下，
-                    // 先 flush 当前 token（若有），再单独 push `">"` 作为操作符 token。
+                    // 特例：若当前正在累积的 token 恰好是裸字符 `1` 或 `2`（隐含其与 `>`
+                    // 之间无空白、无引号、无转义——任何此类间隔都会先 flush 出对应
+                    // 数字 token 或在 current 中混入其他字符，使 `current != "1"` 且
+                    // `current != "2"`），则把 token 升级为 `"1>"` / `"2>"`，与 bash 的
+                    // `1>` / `2>` 重定向语义对齐。其余情况下，先 flush 当前 token（若有），
+                    // 再单独 push `">"` 作为操作符 token。
                     if in_token && current == "1" {
                         current.clear();
                         tokens.push("1>".to_string());
+                    } else if in_token && current == "2" {
+                        current.clear();
+                        tokens.push("2>".to_string());
                     } else if in_token {
                         tokens.push(std::mem::take(&mut current));
                         tokens.push(">".to_string());
@@ -198,9 +202,9 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
     Ok(tokens)
 }
 
-/// 结构化的一条命令：去除重定向元信息后的 argv，加上可选的 stdout 重定向目标。
+/// 结构化的一条命令：去除重定向元信息后的 argv，加上可选的 stdout / stderr 重定向目标。
 ///
-/// 当前阶段仅支持 stdout 重定向（`>` / `1>`）；后续阶段可在此扩展 stderr / 追加 /
+/// 当前阶段支持 stdout（`>` / `1>`）与 stderr（`2>`）重定向；后续阶段可在此扩展追加 /
 /// stdin 等字段而不需调整 [`tokenize`] 与上层 REPL 的契约。
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedCommand {
@@ -210,27 +214,36 @@ pub struct ParsedCommand {
     /// stdout 重定向目标文件路径；`None` 表示未指定重定向。
     /// `>` 与 `1>` 完全等价，归一化在本函数内完成。
     pub stdout_redirect: Option<String>,
+    /// stderr 重定向目标文件路径（`2>` 操作符）；`None` 表示未指定。
+    /// 与 stdout_redirect 完全独立：一行中可同时出现 `> out 2> err`，互不干扰。
+    pub stderr_redirect: Option<String>,
 }
 
 /// 把一行输入解析为 [`ParsedCommand`]。
 ///
-/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再单次线性扫描识别 `>` / `1>`：
-/// 把紧随其后的 token 作为 `stdout_redirect`，其余按顺序追加进 `argv`。
+/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再单次线性扫描识别 `>` / `1>` / `2>`：
+/// 把紧随其后的 token 作为对应 `stdout_redirect` / `stderr_redirect`，其余按顺序追加进 `argv`。
 ///
-/// 错误传播：tokenize 阶段的语法错误原样返回；若 `>` / `1>` 后无下一 token，
-/// 返回 [`ParseError::MissingRedirectTarget`]。重复出现的重定向（如 `> a > b`）
-/// 取**最后一次**为准，与 bash 行为一致（前面的目标文件依然被创建/截断，但本阶段
-/// spec 不要求该副作用，故仅记录最后一次即可）。
+/// 错误传播：tokenize 阶段的语法错误原样返回；若任一重定向操作符后无下一 token，
+/// 返回 [`ParseError::MissingRedirectTarget`]。重复出现的同向重定向（如 `> a > b`、
+/// `2> e1 2> e2`）取**最后一次**为准，与 bash 行为一致（前面的目标文件依然被创建/截断，
+/// 但本阶段 spec 不要求该副作用，故仅记录最后一次即可）。
 pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
     let tokens = tokenize(input)?;
     let mut argv: Vec<String> = Vec::with_capacity(tokens.len());
     let mut stdout_redirect: Option<String> = None;
+    let mut stderr_redirect: Option<String> = None;
     let mut iter = tokens.into_iter();
     while let Some(tok) = iter.next() {
-        // 归一化：`>` 与 `1>` 都被识别为「stdout 重定向」操作符
+        // 归一化：`>` 与 `1>` 都识别为 stdout 重定向；`2>` 识别为 stderr 重定向
         if tok == ">" || tok == "1>" {
             match iter.next() {
                 Some(target) => stdout_redirect = Some(target),
+                None => return Err(ParseError::MissingRedirectTarget),
+            }
+        } else if tok == "2>" {
+            match iter.next() {
+                Some(target) => stderr_redirect = Some(target),
                 None => return Err(ParseError::MissingRedirectTarget),
             }
         } else {
@@ -240,6 +253,7 @@ pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
     Ok(ParsedCommand {
         argv,
         stdout_redirect,
+        stderr_redirect,
     })
 }
 
@@ -740,5 +754,103 @@ mod tests {
         let p = parse(r#"echo hi > "/tmp/with space.txt""#).unwrap();
         assert_eq!(p.argv, vec!["echo", "hi"]);
         assert_eq!(p.stdout_redirect, Some("/tmp/with space.txt".to_string()));
+    }
+
+    // ===== `2>` 重定向：tokenize 层 =====
+    // 目的：确认 `2>` 在引号外被切为独立 token；引号内 / 转义后仍按字面量。
+    // 既有用例不含 `2>` 字符序列，零回归风险。
+
+    #[test]
+    fn redirect_2gt_merges_only_when_adjacent() {
+        // 紧贴 `2>` 合并：`ls nodir 2>err` → `2>` 单 token
+        assert_eq!(
+            tokenize("ls nodir 2>err").unwrap(),
+            vec!["ls", "nodir", "2>", "err"]
+        );
+        // 空格分隔形态：`ls nodir 2> err` → 同样合并（`2` 与 `>` 之间无空白）
+        assert_eq!(
+            tokenize("ls nodir 2> err").unwrap(),
+            vec!["ls", "nodir", "2>", "err"]
+        );
+        // 关键负样例：`2` 与 `>` 之间有空白 → 不合并，`2` 是普通 arg，`>` 是独立操作符
+        assert_eq!(
+            tokenize("echo hi 2 > out").unwrap(),
+            vec!["echo", "hi", "2", ">", "out"]
+        );
+        // 关键负样例：`a2>out` 中 `2` 是字符串后缀而非孤立 token → 不合并
+        assert_eq!(
+            tokenize("echo a2>out").unwrap(),
+            vec!["echo", "a2", ">", "out"]
+        );
+    }
+
+    #[test]
+    fn redirect_2gt_inside_quotes_is_literal() {
+        // 单引号内 `2>` 是字面量
+        assert_eq!(
+            tokenize("echo '2> not redirect'").unwrap(),
+            vec!["echo", "2> not redirect"]
+        );
+        // 双引号内 `2>` 是字面量
+        assert_eq!(
+            tokenize(r#"echo "x 2> y""#).unwrap(),
+            vec!["echo", "x 2> y"]
+        );
+    }
+
+    #[test]
+    fn redirect_2gt_escaped_is_literal() {
+        // 引号外反斜杠转义 `>` 紧跟在 `2` 之后 → `2` 是裸字符 token，但 `>` 被转义，
+        // 故不再触发 `2>` 合并，而是 `2` 与 `>` 拼接为字面 `2>` 字符串 token
+        assert_eq!(
+            tokenize(r"echo 2\>out").unwrap(),
+            vec!["echo", "2>out"]
+        );
+    }
+
+    // ===== `2>` 重定向：parse 层 =====
+
+    #[test]
+    fn parse_2gt_extracts_stderr_target() {
+        // 空格分隔形态
+        let p = parse("ls nonexistent 2> /tmp/quz/baz.md").unwrap();
+        assert_eq!(p.argv, vec!["ls", "nonexistent"]);
+        assert_eq!(p.stdout_redirect, None);
+        assert_eq!(p.stderr_redirect, Some("/tmp/quz/baz.md".to_string()));
+        // 紧贴形态
+        let p = parse("ls nonexistent 2>err").unwrap();
+        assert_eq!(p.argv, vec!["ls", "nonexistent"]);
+        assert_eq!(p.stderr_redirect, Some("err".to_string()));
+    }
+
+    #[test]
+    fn parse_stdout_and_stderr_coexist() {
+        // `> out 2> err`：两种重定向同时出现，互不干扰
+        let p = parse("cmd a b > out.txt 2> err.txt").unwrap();
+        assert_eq!(p.argv, vec!["cmd", "a", "b"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert_eq!(p.stderr_redirect, Some("err.txt".to_string()));
+        // 顺序反转同样生效：`2> err > out`
+        let p = parse("cmd a b 2> err.txt > out.txt").unwrap();
+        assert_eq!(p.argv, vec!["cmd", "a", "b"]);
+        assert_eq!(p.stdout_redirect, Some("out.txt".to_string()));
+        assert_eq!(p.stderr_redirect, Some("err.txt".to_string()));
+    }
+
+    #[test]
+    fn parse_2gt_missing_target_errors() {
+        // `2>` 后无 token → 报 MissingRedirectTarget
+        assert_eq!(
+            parse("ls nonexistent 2>"),
+            Err(ParseError::MissingRedirectTarget)
+        );
+    }
+
+    #[test]
+    fn parse_2gt_target_preserves_quoting() {
+        // stderr 目标文件名可被引号包裹（含空格）；parse 不应丢失内容
+        let p = parse(r#"ls nodir 2> "/tmp/err log.md""#).unwrap();
+        assert_eq!(p.argv, vec!["ls", "nodir"]);
+        assert_eq!(p.stderr_redirect, Some("/tmp/err log.md".to_string()));
     }
 }
