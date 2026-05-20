@@ -600,8 +600,10 @@ fn format_arg_completion(full: &str, kind: MatchKind) -> Pair {
 /// - `cmd`：argv[1]，命令名（tokenize 后的首 token，已剥引号）。
 /// - `current_word`：argv[2]，当前正被补全的词（tokenize 后值，已剥引号）。末尾空白
 ///   场景下为空串。
-/// - `prev_word`：argv[3]，前一词（tokenize 后值）。不存在或仅有 cmd 一个 token 时
-///   为空串。注意 prev_word **不**包含 cmd —— 仅在 cmd 之后的实参区找前一词。
+/// - `prev_word`：argv[3]，前一词（tokenize 后值）。**与 bash `complete -C` 语义对齐**：
+///   prev 在完整 tokens 区间（含 cmd）中查找——`git rem<TAB>` 的 prev = `"git"`，
+///   `docker <TAB>` 的 prev = `"docker"`（COMP_WORDS=["docker",""]，prev=COMP_WORDS[0]）。
+///   仅在 tokens 为空（防御路径）时为空串。tester 校验 argv[3] 时严格按此语义比对。
 /// - `literal_len`：光标处『当前词原始字面段』的字节长度，用于计算 replacement 起点
 ///   `start = pos - literal_len`。末尾空白场景为 0（纯插入），与上 stage 等价。
 ///   分离 tokenized 值与字面长度，是为了在引号场景（`cmd 'fo<TAB>`）下不算错替换
@@ -627,10 +629,12 @@ struct CompleterContext {
 /// 用 `bytes()` + `is_ascii_whitespace`：tokenize 已按 ASCII 空白做分隔，本算法
 /// 与之保持一致；非 ASCII 字符（如中文）按非空白处理，自然纳入字面尾段。
 ///
-/// prev_word 提取规则：
-/// - tokens 区间 `[1..]` 为 cmd 之后的实参；末尾空白时整个区间是已完成实参，
-///   prev = 区间最后一项；末尾非空白时区间最后一项是 current_word，prev = 倒数第二项。
-/// - 区间为空（仅 cmd）→ prev = ""。
+/// prev_word 提取规则（**含 cmd**，与 bash `complete -C` 语义一致）：
+/// - 末尾空白：current = ""，prev = tokens 最后一项（仅 cmd 时 prev = cmd）。
+/// - 末尾非空白：current = tokens 最后一项；prev = tokens 倒数第二项（仅 cmd 不可达，
+///   因为本函数前置要求 line_to_pos 含空白；len==1 防御路径返 ""）。
+/// 题面 stage：tester 校验 `git pu<TAB>` 的 argv[3]==`"git"`、`docker <TAB>` 的
+/// argv[3]==`"docker"`，靠这条规则保证 prev 不丢首词。
 fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
     // 1. 必须含至少一个空白（首词已结束）
     if !line_to_pos.chars().any(|c| c.is_whitespace()) {
@@ -649,23 +653,19 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
         .next_back()
         .map_or(false, |c| c.is_whitespace());
 
-    // tokens[1..] 是 cmd 之后的实参区；prev_word 仅在该区间内查找
-    let args = &tokens[1..];
-
+    // tokens 完整区间用于 prev_word 检索（与 bash `complete -C` 语义对齐：
+    // prev 含 cmd——`git pu<TAB>` 的 prev=`"git"`，`docker <TAB>` 的 prev=`"docker"`）
     let (current_word, prev_word) = if trailing_ws {
-        // 末尾空白：current = ""；prev = args 最后一项（区间空则 ""）
-        let prev = args.last().cloned().unwrap_or_default();
+        // 末尾空白：current = ""；prev = tokens 最后一项（至少有 cmd，必非空）
+        let prev = tokens.last().cloned().unwrap_or_default();
         (String::new(), prev)
     } else {
-        // 末尾非空白：current = args 最后一项；prev = args 倒数第二项
-        // 注意：当 args 为空（仅 cmd 一个 token + 无尾空白）的形态在调用前提下不可能
-        // 出现——line_to_pos 含空白才会进入本函数，而仅 cmd 无空白时不会含空白。
-        // 但末尾空白会被消费产生 args 末项；这里仍按防御性处理：
-        //   args 至少 1 项 → current = args.last()；
-        //   args 0 项（理论不可达）→ current = ""，prev = ""。
-        let current = args.last().cloned().unwrap_or_default();
-        let prev = if args.len() >= 2 {
-            args[args.len() - 2].clone()
+        // 末尾非空白：current = tokens 最后一项；prev = tokens 倒数第二项
+        // 注意：len==1（仅 cmd 且无尾空白）在调用前提下不可达——line_to_pos 含空白
+        // 才会进入本函数，而仅 cmd 无空白时不会含空白。防御性处理 len<2 → prev = ""。
+        let current = tokens.last().cloned().unwrap_or_default();
+        let prev = if tokens.len() >= 2 {
+            tokens[tokens.len() - 2].clone()
         } else {
             String::new()
         };
@@ -1006,10 +1006,10 @@ mod tests {
 
     #[test]
     fn ctx_cmd_only_trailing_space() {
-        // `docker <TAB>`：current="" prev="" literal_len=0
+        // `docker <TAB>`：current="" prev="docker"（与 bash 语义一致，prev 含 cmd）literal_len=0
         assert_eq!(
             ctx("docker "),
-            Some(("docker".to_string(), String::new(), String::new(), 0))
+            Some(("docker".to_string(), String::new(), "docker".to_string(), 0))
         );
     }
 
@@ -1017,20 +1017,20 @@ mod tests {
     fn ctx_cmd_only_multispace() {
         assert_eq!(
             ctx("docker   "),
-            Some(("docker".to_string(), String::new(), String::new(), 0))
+            Some(("docker".to_string(), String::new(), "docker".to_string(), 0))
         );
         assert_eq!(
             ctx("docker\t"),
-            Some(("docker".to_string(), String::new(), String::new(), 0))
+            Some(("docker".to_string(), String::new(), "docker".to_string(), 0))
         );
     }
 
     #[test]
     fn ctx_cmd_with_partial_first_arg() {
-        // `git rem<TAB>`：current="rem" prev="" literal_len=3
+        // `git rem<TAB>`：current="rem" prev="git"（prev 含 cmd）literal_len=3
         assert_eq!(
             ctx("git rem"),
-            Some(("git".to_string(), "rem".to_string(), String::new(), 3))
+            Some(("git".to_string(), "rem".to_string(), "git".to_string(), 3))
         );
     }
 
@@ -1078,10 +1078,10 @@ mod tests {
 
     #[test]
     fn ctx_leading_whitespace() {
-        // 前导空白允许
+        // 前导空白允许；prev 含 cmd
         assert_eq!(
             ctx("  docker "),
-            Some(("docker".to_string(), String::new(), String::new(), 0))
+            Some(("docker".to_string(), String::new(), "docker".to_string(), 0))
         );
         assert_eq!(
             ctx("  git remote set"),
@@ -1137,6 +1137,17 @@ mod tests {
         assert_eq!(l, 3); // "set"
         let (_, _, _, l) = ctx("a bcdef").unwrap();
         assert_eq!(l, 5); // "bcdef"
+    }
+
+    #[test]
+    fn ctx_stage_ep2_git_pu_argv_contract() {
+        // Stage EP2 主例：tester 校验 `git pu<TAB>` 调用脚本时
+        //   argv[1]=cmd="git"，argv[2]=current_word="pu"，argv[3]=prev_word="git"
+        // prev=`"git"` 是 bash `complete -C` 真实语义（COMP_WORDS=["git","pu"]，prev=COMP_WORDS[0]）
+        assert_eq!(
+            ctx("git pu"),
+            Some(("git".to_string(), "pu".to_string(), "git".to_string(), 2))
+        );
     }
 
     // ---- parse_completer_stdout：多候选解析纯函数 ----
