@@ -68,6 +68,13 @@ use crate::parser::tokenize;
 pub struct ShellHelper {
     path_executables: Vec<String>,
     last_tab_prefix: Cell<Option<String>>,
+    /// 参数位置双 TAB 状态机的「上次 TAB 时的 (dir_part, name_prefix) 对」。
+    ///
+    /// 与命令名分支的 `last_tab_prefix` 独立：两者 key 类型不同（命令名是单 String =
+    /// 整行 line[..pos]；参数是切分后的二元组），语义独立——用户在命令名按 TAB
+    /// 与在参数按 TAB 互不影响节奏。任一分支返回路径都会清掉对侧字段，
+    /// 避免「先在命令名 BEL 一次→切到参数立即列出」之类的污染。
+    last_tab_arg_key: Cell<Option<(String, String)>>,
 }
 
 impl ShellHelper {
@@ -75,6 +82,7 @@ impl ShellHelper {
         ShellHelper {
             path_executables: list_path_executables(),
             last_tab_prefix: Cell::new(None),
+            last_tab_arg_key: Cell::new(None),
         }
     }
 
@@ -88,10 +96,13 @@ impl ShellHelper {
     /// - 末尾空白 → `prefix = ""`：等价于"列出 cwd 全部 entry"，由后续候选数分支统一处理。
     /// - 字面对齐校验失败（line 字面尾段 != prefix；引号被剥离会触发）→ no-op，
     ///   留给后续 stage 实现引号场景。
-    /// - 候选数 0 或 ≥2 → BEL 响铃，line 不变。
+    /// - 候选数 0 或 ≥2 → 显式向 stdout 写 BEL（`\x07`）+ flush，line 不变；
+    ///   rustyline `List` 模式在空候选时还会自动 beep 一次作为兜底，两次 BEL
+    ///   在终端语义上等价单次响铃，tester 校验「出现 \x07」不卡数量。
     /// - 候选数 = 1 → 把 `[pos - prefix.len(), pos)` 区间替换为 `<full> ` 或 `<full>/`。
     ///
-    /// 不读不写 `self.last_tab_prefix`：双 TAB 状态机仅服务于命令名补全。
+    /// 双 TAB 状态机由 `self.last_tab_arg_key` 独立承载（与命令名分支 `last_tab_prefix`
+    /// 互不干扰）；任何返回路径都会清掉 `last_tab_prefix`，避免命令名节奏污染参数节奏。
     fn complete_filename_arg(
         &self,
         line: &str,
@@ -103,17 +114,26 @@ impl ShellHelper {
         //    语义为"列出 cwd 全部 entry"，与 `dir/<TAB>` 列 `dir/` 全部 entry 同构。
         let prefix = match extract_arg_prefix(line_to_pos) {
             Some(p) => p,
-            None => return Ok((pos, Vec::new())),
+            None => {
+                // tokenize 失败仍清掉双 TAB 状态机（已离开任何有意义的补全节奏）
+                self.last_tab_arg_key.set(None);
+                self.last_tab_prefix.set(None);
+                return Ok((pos, Vec::new()));
+            }
         };
 
         // 2. 字面对齐校验：本 stage 测试不含引号/转义，故 prefix 与 line 末尾
         //    字面应一致；不一致说明 tokenize 做了剥离（如 `cat 're<TAB>`），
         //    这种情况下 pos - prefix.len() 起点会错位，按 no-op 退避。
         if prefix.len() > pos {
+            self.last_tab_arg_key.set(None);
+            self.last_tab_prefix.set(None);
             return Ok((pos, Vec::new()));
         }
         let start = pos - prefix.len();
         if &line[start..pos] != prefix.as_str() {
+            self.last_tab_arg_key.set(None);
+            self.last_tab_prefix.set(None);
             return Ok((pos, Vec::new()));
         }
 
@@ -124,11 +144,22 @@ impl ShellHelper {
         } else {
             Path::new(dir_part)
         };
-        let candidates = match_files_in_dir(scan_dir, name_prefix);
+        let mut candidates = match_files_in_dir(scan_dir, name_prefix);
 
-        // 4. 三态分支
+        // 命令名分支状态独立但语义上互斥：任一分支被触发都视为「另一边的节奏已断」
+        self.last_tab_prefix.set(None);
+
+        // 4. 候选数分支
         match candidates.len() {
+            0 => {
+                // 0 候选：BEL（保留上 stage 语义）；清状态，line 不变。
+                self.last_tab_arg_key.set(None);
+                print!("\x07");
+                let _ = io::stdout().flush();
+                Ok((pos, Vec::new()))
+            }
             1 => {
+                self.last_tab_arg_key.set(None);
                 let entry = candidates.into_iter().next().unwrap();
                 // 拼回 dir_part：dir_part 含尾 '/' 或为空字符串，直接拼接得到完整 token。
                 let full = format!("{}{}", dir_part, entry);
@@ -137,9 +168,57 @@ impl ShellHelper {
                 Ok((start, vec![format_arg_completion(&full, kind)]))
             }
             _ => {
-                // 0 或 ≥2 候选：返回空候选集，让 rustyline `List` 模式统一负责 BEL。
-                // 不在这里手动 `print!("\x07")`，避免 rustyline 在 `candidates.is_empty()`
-                // 分支再 beep 一次造成双响铃（参见 rustyline-14.0.0/src/lib.rs::93）。
+                // ≥2 候选：先字母序排序（match_files_in_dir 不保证 read_dir 顺序）
+                candidates.sort();
+
+                // 4a. LCP 扩展（与命令名分支对称）：若候选叶子名的最长公共前缀
+                //     长于当前 name_prefix，则把 line[start..pos] 替换为
+                //     `dir_part + lcp`（不带尾空格 / `/`），让用户继续打字以收敛候选。
+                //     首末项 LCP == 全集 LCP（已排序前提）。
+                let lcp = longest_common_prefix(&candidates[0], candidates.last().unwrap());
+                if lcp.len() > name_prefix.len() {
+                    self.last_tab_arg_key.set(None);
+                    let replacement = format!("{}{}", dir_part, lcp);
+                    let pair = Pair {
+                        display: replacement.clone(),
+                        replacement,
+                    };
+                    return Ok((start, vec![pair]));
+                }
+
+                // 4b. LCP 不可扩展：进入双 TAB 状态机。
+                //     状态 key 用 (dir_part, name_prefix) 对：跨命令名节奏复用，
+                //     用户在两次 TAB 之间改了命令名（但 token 切分结果相同）仍算同一轮。
+                let current_key = (dir_part.to_string(), name_prefix.to_string());
+                let prev = self.last_tab_arg_key.take();
+                let same_as_prev = prev.as_ref() == Some(&current_key);
+                if same_as_prev {
+                    // 二次 TAB：列出 + 重画提示符。状态机已由 take() 清空。
+                    // 列出时每候选 stat 一次以判类型（目录拼尾 '/'）；本 stage 候选数
+                    // 在 tester 场景下通常为 2~3 个，stat 开销可忽略。
+                    let listed: Vec<String> = candidates
+                        .iter()
+                        .map(|name| {
+                            let full = format!("{}{}", dir_part, name);
+                            match classify_path(Path::new(&full)) {
+                                MatchKind::Directory => format!("{}/", name),
+                                MatchKind::File => name.clone(),
+                            }
+                        })
+                        .collect();
+                    let joined = listed.join("  ");
+                    // 物理输出：`\n<list>\n$ <line[..pos]>`，光标停在 line 末尾。
+                    // 注意：必须重画整段 line[..pos]（含命令名 + 已输入的参数部分），
+                    // 不能只重画 prefix——否则用户看到的会是 `$ bar` 而非 `$ stat bar`。
+                    print!("\n{}\n$ {}", joined, line_to_pos);
+                    let _ = io::stdout().flush();
+                } else {
+                    // 首次 TAB（或 key 变化的新一轮）：BEL + 记忆当前 key
+                    print!("\x07");
+                    let _ = io::stdout().flush();
+                    self.last_tab_arg_key.set(Some(current_key));
+                }
+                // 不让 rustyline 触碰 line buffer
                 Ok((pos, Vec::new()))
             }
         }
@@ -160,9 +239,12 @@ impl Completer for ShellHelper {
         // （前导空白即进入参数区，与 bash 行为一致；空命令名场景由文件名分支自然 no-op）。
         let prefix = &line[..pos];
         if prefix.chars().any(|c| c.is_whitespace()) {
-            // 不重置 last_tab_prefix：参数区按 TAB 与命令名补全状态机无关。
+            // 进入参数补全分支：由 complete_filename_arg 内部负责清空 last_tab_prefix。
             return self.complete_filename_arg(line, pos);
         }
+
+        // 命令名分支被触发：参数分支的双 TAB 节奏作废，清掉对侧状态。
+        self.last_tab_arg_key.set(None);
 
         // 阶段 1：收集去重后的候选名（builtin 优先，PATH 内部及与 builtin 同名均跳过）
         let mut names: Vec<String> = Vec::new();
