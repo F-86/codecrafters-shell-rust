@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
+use std::rc::Rc;
 
 mod builtins;
 mod completion;
@@ -33,11 +35,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    editor.set_helper(Some(ShellHelper::new()));
-
     // `complete -C <path> <cmd>` 注册的补全脚本表（command → completer path）。
-    // 放在 REPL 主循环外以跨命令存活；单线程 REPL 故无并发需求，不需要 static/Mutex。
-    let mut completions: HashMap<String, String> = HashMap::new();
+    // 放在 REPL 主循环外以跨命令存活。
+    //
+    // 用 `Rc<RefCell<...>>` 而非裸 `HashMap`：
+    // - dispatch 写端（`complete -C ...` 命令）需要 `&mut HashMap`，沿用 `run_complete` 现签名；
+    // - 读端在 `ShellHelper`（TAB 补全路径）内部，需要在 `&self` 方法里查 registry。
+    // 两端走同一份 Rc 克隆，单线程 REPL 串行节奏天然不并发借用。
+    let completions: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+
+    editor.set_helper(Some(ShellHelper::new(completions.clone())));
 
     loop {
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
@@ -135,7 +142,12 @@ fn main() {
                 }
             }
             "complete" => {
-                if let Err(e) = run_complete(&mut *sink, &mut *err_sink, args, &mut completions) {
+                if let Err(e) = run_complete(
+                    &mut *sink,
+                    &mut *err_sink,
+                    args,
+                    &mut *completions.borrow_mut(),
+                ) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
