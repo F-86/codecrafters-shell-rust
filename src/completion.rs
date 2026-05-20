@@ -8,6 +8,11 @@
 //! - 去重：同名时 **builtin 优先**，PATH 同名忽略；PATH 内部不同目录的同名也只取首个，
 //!   与 `find_in_path` 按 PATH 顺序解析的执行行为对齐。用 `HashSet<&str>` 跟踪已加入名字。
 //!
+//! 参数位置单匹配的目录识别：
+//! - 候选若为目录 → 替换为 `<full>/`，**不**加尾空格，便于继续 TAB 进入下一层。
+//! - 候选若为文件 → 替换为 `<full> `（保持上 stage 语义）。
+//! - 跟随 symlink（与 bash/zsh/fish 一致）；stat 失败安全退化为文件分支。
+//!
 //! 多候选状态机（四态）：
 //! - **0 候选**：no-op，line 不变。
 //! - **1 候选**：直接替换为 `<name> `（末尾空格），与单候选 stage 行为一致。
@@ -126,11 +131,9 @@ impl ShellHelper {
                 let entry = candidates.into_iter().next().unwrap();
                 // 拼回 dir_part：dir_part 含尾 '/' 或为空字符串，直接拼接得到完整 token。
                 let full = format!("{}{}", dir_part, entry);
-                let pair = Pair {
-                    display: full.clone(),
-                    replacement: format!("{} ", full),
-                };
-                Ok((start, vec![pair]))
+                // 目录 → 尾 `/`、不加空格；文件 → 尾空格。stat 失败按文件退化（安全方向）。
+                let kind = classify_path(Path::new(&full));
+                Ok((start, vec![format_arg_completion(&full, kind)]))
             }
             _ => {
                 // 0 或 ≥2：BEL 响铃，line 不变
@@ -328,6 +331,57 @@ fn match_files_in_dir(dir: &Path, name_prefix: &str) -> Vec<String> {
     out
 }
 
+/// 单匹配 entry 的类型分类。
+///
+/// 用枚举而非 `bool` 标志：调用点 `format_arg_completion(&full, MatchKind::Directory)`
+/// 比 `format_arg_completion(&full, true)` 自解释；未来扩展（如 `Symlink` /
+/// `Executable` / `Hidden`）时函数签名不变，符合 Rust API guidelines 关于
+/// "prefer enums to bool flags" 的建议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    File,
+    Directory,
+}
+
+/// 判定 `path` 是文件还是目录（跟随 symlink，与 bash/zsh/fish 一致）。
+///
+/// `fs::metadata` 与 `symlink_metadata` 的关键差异：前者跟随 symlink 取最终目标的
+/// 元数据，后者返回 symlink 自身。真实 shell 的目录补全按目标类型决定尾随字符
+/// （指向目录的 symlink 也加 `/`），故选用 `fs::metadata`。
+///
+/// 错误处理：任何 I/O 失败（路径不存在 / 权限不足 / TOCTOU 即读即删）一律退化为
+/// `MatchKind::File` —— 对调用方而言，"加尾空格" 是语义安全的退化（用户至多在
+/// 不存在路径上多打个空格），优于"目录被识别为文件后无法继续 TAB" 的反向 bug。
+fn classify_path(path: &Path) -> MatchKind {
+    match fs::metadata(path) {
+        Ok(m) if m.is_dir() => MatchKind::Directory,
+        _ => MatchKind::File,
+    }
+}
+
+/// 把单匹配的完整路径与类型格式化为 rustyline 的 `Pair`。
+///
+/// - `MatchKind::Directory` → `replacement = "{full}/"`，**无**尾空格，便于用户
+///   立即再次按 TAB 进入下一层。
+/// - `MatchKind::File`      → `replacement = "{full} "`，加尾空格，沿用上 stage
+///   文件名补全语义。
+///
+/// `display` 与 `replacement` 视觉一致（目录的 `display` 也带 `/`）：rustyline 在
+/// 多候选列表场景下会读取 `display`，与 bash `ls -F` / `complete` 的展示风格对齐，
+/// 便于后续多匹配 stage 直接复用。
+fn format_arg_completion(full: &str, kind: MatchKind) -> Pair {
+    match kind {
+        MatchKind::Directory => Pair {
+            display: format!("{}/", full),
+            replacement: format!("{}/", full),
+        },
+        MatchKind::File => Pair {
+            display: full.to_string(),
+            replacement: format!("{} ", full),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::longest_common_prefix as lcp;
@@ -452,5 +506,61 @@ mod tests {
             "",
         );
         assert!(v.is_empty());
+    }
+
+    // ---- classify_path 用例 ----
+    // 依赖 cargo 测试 cwd = crate root：src/ 是目录，Cargo.toml 是文件。
+    #[test]
+    fn classify_path_directory() {
+        assert_eq!(
+            super::classify_path(std::path::Path::new("src")),
+            super::MatchKind::Directory
+        );
+    }
+
+    #[test]
+    fn classify_path_file() {
+        assert_eq!(
+            super::classify_path(std::path::Path::new("Cargo.toml")),
+            super::MatchKind::File
+        );
+    }
+
+    #[test]
+    fn classify_path_missing_falls_back_to_file() {
+        // 路径不存在 → 退化为 File（加尾空格是安全方向）
+        assert_eq!(
+            super::classify_path(std::path::Path::new("zzz_no_such_path_qqq")),
+            super::MatchKind::File
+        );
+    }
+
+    // ---- format_arg_completion 用例 ----
+    #[test]
+    fn format_arg_completion_file_flat() {
+        let p = super::format_arg_completion("foo.txt", super::MatchKind::File);
+        assert_eq!(p.display, "foo.txt");
+        assert_eq!(p.replacement, "foo.txt ");
+    }
+
+    #[test]
+    fn format_arg_completion_directory_flat() {
+        let p = super::format_arg_completion("project", super::MatchKind::Directory);
+        assert_eq!(p.display, "project/");
+        assert_eq!(p.replacement, "project/");
+    }
+
+    #[test]
+    fn format_arg_completion_file_nested() {
+        let p = super::format_arg_completion("path/to/foo.txt", super::MatchKind::File);
+        assert_eq!(p.display, "path/to/foo.txt");
+        assert_eq!(p.replacement, "path/to/foo.txt ");
+    }
+
+    #[test]
+    fn format_arg_completion_directory_nested() {
+        let p = super::format_arg_completion("pig/dog", super::MatchKind::Directory);
+        assert_eq!(p.display, "pig/dog/");
+        assert_eq!(p.replacement, "pig/dog/");
     }
 }
