@@ -28,8 +28,11 @@
 //!
 //! 命令级脚本分支（`complete -C` 注册）独立承载第三套双 TAB 状态机：
 //! `last_tab_script_key` 以 `(cmd, current_word, prev_word)` 三元组为 key，与命令名 /
-//! 文件名两个分支并列、互斥清空。多候选**不做 LCP 扩展**（题目本 stage 明确要求），
-//! 严格遵循「首次 TAB 响铃，二次 TAB 列出 + 重画提示符」的三态语义。
+//! 文件名两个分支并列、互斥清空。多候选语义对齐 bash：
+//!   - 优先尝试 LCP 扩展：若候选 LCP 严格长于 `current_word` → 替换 `[start, pos)`
+//!     为 LCP（不带尾空格），不响铃、不列出，节奏作废；
+//!   - LCP ≤ current_word → 走双 TAB 节奏：「首次 TAB 响铃，二次 TAB 列出 + 重画提示符」。
+//! 替换起点 `start = pos - literal_len`，仅替换当前词字面，与单候选臂一致。
 //!
 //! LCP 算法：候选已字典序排序后，**首末两项的公共前缀 == 全集 LCP**（介于首末之间
 //! 的串其各位置字符必落于首末项相应位置之间或相等，故全集 LCP 与首末项 LCP 相等）。
@@ -333,9 +336,28 @@ impl Completer for ShellHelper {
                         Ok((start, vec![pair]))
                     }
                     Some(mut names) => {
-                        // 多候选（≥2）：按字母序排序后进入双 TAB 状态机；
-                        // **本 stage 不做 LCP 扩展**（题目 Notes 明确）
+                        // 多候选（≥2）：先排序，再优先尝试 LCP 扩展，未命中时回落双 TAB 状态机。
+                        // 排序后首末项的最长公共前缀即全集 LCP（按字典序排列下的成立性）。
                         names.sort();
+
+                        // LCP 扩展路径（与命令名 / 文件名分支同构）：
+                        // 当所有候选共享比 current_word 严格更长的公共前缀时，把当前词字面
+                        // `[start, pos)` 替换为 LCP（不带尾空格），节奏作废。
+                        // 严格 `>` 比较——题面 Notes：「LCP 等于已输入」按"无可扩展"处理，
+                        // 让出给下方双 TAB 路径响铃 + 列出。
+                        let lcp =
+                            longest_common_prefix(&names[0], names.last().unwrap()).to_string();
+                        if lcp.len() > ctx.current_word.len() {
+                            // LCP 扩展：清掉脚本分支双 TAB 状态机（任何后续 TAB 都另起一轮）；
+                            // 起点 = start = pos - literal_len，仅替换当前词字面，不动命令名 / 前置 args。
+                            self.last_tab_script_key.set(None);
+                            let pair = Pair {
+                                display: lcp.clone(),
+                                replacement: lcp,
+                            };
+                            return Ok((start, vec![pair]));
+                        }
+
                         let current_key = (
                             ctx.cmd.clone(),
                             ctx.current_word.clone(),
@@ -1219,5 +1241,38 @@ mod tests {
         assert_eq!(parse(""), None);
         assert_eq!(parse("\n"), None);
         assert_eq!(parse("\r\n\r\n"), None);
+    }
+
+    // ---- Stage EP3：LCP 扩展决策的边界用例 ----
+    // 调用方决策表达式：`lcp.len() > current_word.len()` → 触发 LCP 扩展；
+    // 否则走双 TAB 节奏。下列断言锁死本 stage 关键场景的 LCP 长度对比，
+    // 避免后续重构改动 longest_common_prefix 时悄悄漂移决策结果。
+
+    #[test]
+    fn lcp_stage_ep3_strictly_longer_than_current_word() {
+        // 题面主例：current_word = "c"（len 1），候选 ["checkout", "cherry-pick"]
+        // → LCP = "che"（len 3），3 > 1 命中扩展路径
+        let lcp_str = lcp("checkout", "cherry-pick");
+        assert_eq!(lcp_str, "che");
+        assert!(lcp_str.len() > "c".len());
+    }
+
+    #[test]
+    fn lcp_stage_ep3_equal_to_current_word_no_extend() {
+        // 边界：current_word 已经等于 LCP，按题面 Notes 应"按无可扩展处理"
+        // → 严格大于比较 (3 > 3) 为 false，调用方走响铃 + 列出
+        let lcp_str = lcp("apply", "append");
+        assert_eq!(lcp_str, "app");
+        assert!(!(lcp_str.len() > "app".len()));
+    }
+
+    #[test]
+    fn lcp_stage_ep3_empty_lcp_no_extend() {
+        // 完全无公共前缀：候选首字母即分歧 → LCP = ""
+        // → 0 > current_word.len() 永远 false（current_word 至少 1 字节才进 TAB），
+        //   调用方走响铃 + 列出
+        let lcp_str = lcp("foo", "bar");
+        assert_eq!(lcp_str, "");
+        assert!(!(lcp_str.len() > "f".len()));
     }
 }
