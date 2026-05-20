@@ -39,6 +39,7 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::fs;
 use std::io::{self, Write};
 
 use rustyline::completion::{Completer, Pair};
@@ -48,6 +49,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 
 use crate::builtins::{list_path_executables, BUILTINS};
+use crate::parser::tokenize;
 
 /// rustyline 的 Helper 聚合体；承载 builtin 列表（编译期常量）+ PATH 可执行文件缓存
 /// + 双 TAB 状态机所需的「上次 TAB 时的前缀」。
@@ -69,6 +71,66 @@ impl ShellHelper {
             last_tab_prefix: Cell::new(None),
         }
     }
+
+    /// 参数位置文件名补全（本 stage 仅处理 cwd、单匹配场景）。
+    ///
+    /// 调用前置条件：`line[..pos]` 至少含一个空白（已离开命令名区）；该判定在
+    /// `Completer::complete` 入口完成，本方法不再重复。
+    ///
+    /// 行为：
+    /// - prefix 提取失败（tokenize 错误 / 末尾空白 / 无 token）→ 静默 no-op，
+    ///   不响铃（避免对未闭合引号场景产生噪音）。
+    /// - 字面对齐校验失败（line 字面尾段 != prefix；引号被剥离会触发）→ no-op，
+    ///   留给后续 stage 实现引号场景。
+    /// - 候选数 0 或 ≥2 → BEL 响铃，line 不变。
+    /// - 候选数 = 1 → 把 `[pos - prefix.len(), pos)` 区间替换为 `<name> `。
+    ///
+    /// 不读不写 `self.last_tab_prefix`：双 TAB 状态机仅服务于命令名补全。
+    fn complete_filename_arg(
+        &self,
+        line: &str,
+        pos: usize,
+    ) -> Result<(usize, Vec<Pair>)> {
+        let line_to_pos = &line[..pos];
+
+        // 1. 提取前缀；任一失败路径 → 静默 no-op
+        let prefix = match extract_arg_prefix(line_to_pos) {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok((pos, Vec::new())),
+        };
+
+        // 2. 字面对齐校验：本 stage 测试不含引号/转义，故 prefix 与 line 末尾
+        //    字面应一致；不一致说明 tokenize 做了剥离（如 `cat 're<TAB>`），
+        //    这种情况下 pos - prefix.len() 起点会错位，按 no-op 退避。
+        if prefix.len() > pos {
+            return Ok((pos, Vec::new()));
+        }
+        let start = pos - prefix.len();
+        if &line[start..pos] != prefix.as_str() {
+            return Ok((pos, Vec::new()));
+        }
+
+        // 3. 扫描 cwd 找候选
+        let candidates = match_files_in_cwd(&prefix);
+
+        // 4. 三态分支
+        match candidates.len() {
+            1 => {
+                let name = candidates.into_iter().next().unwrap();
+                let pair = Pair {
+                    display: name.clone(),
+                    replacement: format!("{} ", name),
+                };
+                Ok((start, vec![pair]))
+            }
+            _ => {
+                // 0 或 ≥2：BEL 响铃，line 不变
+                print!("\x07");
+                let _ = io::stdout().flush();
+                Ok((pos, Vec::new()))
+            }
+        }
+    }
 }
 
 impl Completer for ShellHelper {
@@ -80,12 +142,13 @@ impl Completer for ShellHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> Result<(usize, Vec<Pair>)> {
-        // 仅在首词位置触发：光标左侧子串不含任何空白即视为仍在键入命令名。
-        // 例：`ech` -> 触发；`echo he` -> 不触发；`  ech` -> 不触发（保守不补，避免引入额外语义）。
+        // 仅在首词位置触发命令名补全：光标左侧子串不含任何空白即视为仍在键入命令名。
+        // 例：`ech` -> 命令名补全；`echo he` -> 文件名补全；`  ech` -> 文件名补全
+        // （前导空白即进入参数区，与 bash 行为一致；空命令名场景由文件名分支自然 no-op）。
         let prefix = &line[..pos];
         if prefix.chars().any(|c| c.is_whitespace()) {
             // 不重置 last_tab_prefix：参数区按 TAB 与命令名补全状态机无关。
-            return Ok((pos, Vec::new()));
+            return self.complete_filename_arg(line, pos);
         }
 
         // 阶段 1：收集去重后的候选名（builtin 优先，PATH 内部及与 builtin 同名均跳过）
@@ -188,9 +251,55 @@ fn longest_common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     }
 }
 
+/// 从「光标左侧子串」中提取参数位置补全的前缀。
+///
+/// 输入约定：调用方已确认 `line_to_pos` 至少含一个空白（即处于参数区，不再是命令名）。
+/// 返回 `None` 表示当前路径下应 no-op（不响铃也不补全）：
+/// - tokenize 失败（未闭合引号等）；
+/// - `line_to_pos` 末尾是空白：用户刚结束一个 token 就按 TAB，prefix 为空，
+///   本 stage 不实现"列出全部"，故按 no-op 处理；
+/// - tokens 为空（理论不可达，防御性）。
+///
+/// 末尾非空白时，返回 `Some(tokens.last().clone())`：tokenize 折叠了空白并按
+/// 引号语义剥离，所以这是用户正在键入的"逻辑前缀"。
+/// 注：本 stage 测试不含引号/转义，所以逻辑前缀与 line 中字面子串等长；调用方
+/// 仍需做一道字面对齐校验以兜底未覆盖的情形（见 `complete_filename_arg`）。
+fn extract_arg_prefix(line_to_pos: &str) -> Option<String> {
+    // 末尾空白 → prefix 为空 → no-op（避免列出全部）
+    if line_to_pos.chars().next_back().map_or(true, |c| c.is_whitespace()) {
+        return None;
+    }
+    let tokens = tokenize(line_to_pos).ok()?;
+    tokens.into_iter().last()
+}
+
+/// 扫描当前工作目录，返回所有以 `prefix` 字面开头的 entry 文件名。
+///
+/// - 不区分 file/dir（本 stage 测试只放普通文件；目录尾随 `/` 留待后续 stage）。
+/// - 隐藏文件天然纳入：`read_dir` 不会自动过滤 `.` 开头条目，且本函数不主动跳过。
+/// - I/O 失败（read_dir 或 DirEntry 解析失败）静默返回空 Vec：补全是交互路径，
+///   写错误日志会污染用户输入区。
+/// - 复杂度 O(N)，N 为 cwd 条目数；TAB 是低频交互，不做缓存。
+fn match_files_in_cwd(prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let iter = match fs::read_dir(".") {
+        Ok(it) => it,
+        Err(_) => return out,
+    };
+    for entry in iter.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) {
+            out.push(name.into_owned());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::longest_common_prefix as lcp;
+    use super::extract_arg_prefix;
 
     #[test]
     fn lcp_basic() {
@@ -201,5 +310,62 @@ mod tests {
         assert_eq!(lcp("", "abc"), "");
         assert_eq!(lcp("abc", ""), "");
         assert_eq!(lcp("same", "same"), "same");
+    }
+
+    #[test]
+    fn extract_prefix_normal() {
+        // 普通参数：取最后一个 token
+        assert_eq!(extract_arg_prefix("cat re"), Some("re".to_string()));
+        assert_eq!(extract_arg_prefix("xyz read"), Some("read".to_string()));
+        // 多个参数：仍取最后一个
+        assert_eq!(
+            extract_arg_prefix("cat foo bar bz"),
+            Some("bz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_prefix_trailing_space_returns_none() {
+        // 末尾空白：prefix 为空，本 stage 按 no-op
+        assert_eq!(extract_arg_prefix("cat re "), None);
+        assert_eq!(extract_arg_prefix("cat "), None);
+        // 多空白同样返回 None
+        assert_eq!(extract_arg_prefix("cat   "), None);
+    }
+
+    #[test]
+    fn extract_prefix_tokenize_error_returns_none() {
+        // 未闭合单引号 → tokenize 报错 → no-op
+        assert_eq!(extract_arg_prefix("cat 'unclosed"), None);
+        // 未闭合双引号
+        assert_eq!(extract_arg_prefix("cat \"unclosed"), None);
+        // 行尾孤立反斜杠
+        assert_eq!(extract_arg_prefix("cat foo\\"), None);
+    }
+
+    // 以下集成性测试依赖 cargo 测试工作目录 = crate root 这一既定行为。
+    // 我们使用项目自带的 `Cargo.toml` / `Cargo.lock` / `README.md` 作为只读 fixture。
+    #[test]
+    fn match_files_finds_unique_prefix() {
+        // `Cargo.t` 在本仓库内仅匹配 Cargo.toml
+        let v = super::match_files_in_cwd("Cargo.t");
+        assert_eq!(v, vec!["Cargo.toml".to_string()]);
+    }
+
+    #[test]
+    fn match_files_multi_match_returns_all() {
+        // `Cargo.` 匹配 Cargo.toml 与 Cargo.lock
+        let mut v = super::match_files_in_cwd("Cargo.");
+        v.sort();
+        assert_eq!(
+            v,
+            vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()]
+        );
+    }
+
+    #[test]
+    fn match_files_no_match_empty() {
+        let v = super::match_files_in_cwd("zzz_no_such_prefix_");
+        assert!(v.is_empty());
     }
 }
