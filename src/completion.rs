@@ -137,9 +137,9 @@ impl ShellHelper {
                 Ok((start, vec![format_arg_completion(&full, kind)]))
             }
             _ => {
-                // 0 或 ≥2：BEL 响铃，line 不变
-                print!("\x07");
-                let _ = io::stdout().flush();
+                // 0 或 ≥2 候选：返回空候选集，让 rustyline `List` 模式统一负责 BEL。
+                // 不在这里手动 `print!("\x07")`，避免 rustyline 在 `candidates.is_empty()`
+                // 分支再 beep 一次造成双响铃（参见 rustyline-14.0.0/src/lib.rs::93）。
                 Ok((pos, Vec::new()))
             }
         }

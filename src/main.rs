@@ -11,12 +11,21 @@ use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
 use rustyline::error::ReadlineError;
-use rustyline::Editor;
+use rustyline::{Config, CompletionType, Editor};
 
 fn main() {
     // 1. 初始化 rustyline Editor，并安装自定义 Helper（提供 TAB 补全）。
-    //    若构造失败（极少见，如终端能力探测异常），打印错误后直接退出。
-    let mut editor: Editor<ShellHelper, _> = match Editor::new() {
+    //    - `CompletionType::List`：单候选时直接用 `replacement` 替换 line buffer 并刷新；
+    //      与我们 Helper 已经手算好 `replacement`（含尾空格 / 尾 `/`）的语义对齐。
+    //      默认的 `Circular` 在单候选时会进入"按 TAB 切下一候选"的内部循环，第二次 TAB
+    //      不会再调 `Completer::complete`，直接把 line 回退到 backup —— 与「`dir/<TAB>` 进入
+    //      下一层」的链式补全语义冲突，故必须显式选 `List`。
+    //    - 其余配置走 rustyline 默认值。
+    //    - 若构造失败（极少见，如终端能力探测异常），打印错误后直接退出。
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor: Editor<ShellHelper, _> = match Editor::with_config(config) {
         Ok(ed) => ed,
         Err(e) => {
             eprintln!("shell: failed to init readline: {}", e);
