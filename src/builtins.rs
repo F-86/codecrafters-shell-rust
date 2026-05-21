@@ -15,7 +15,9 @@ use std::process::Child;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
-pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete", "jobs"];
+pub const BUILTINS: &[&str] = &[
+    "echo", "exit", "type", "pwd", "cd", "complete", "jobs", "history",
+];
 
 /// 后台作业状态。
 ///
@@ -481,6 +483,54 @@ pub fn run_jobs(
     Ok(())
 }
 
+/// `history` 内建：列出本次 shell 会话已执行过的命令历史。
+///
+/// codecrafters「history as a shell builtin」阶段：本 stage tester 只验证
+/// `type history` 输出 `history is a shell builtin`（由 `run_type` + `BUILTINS`
+/// 自动覆盖），但既然分发到本函数就一并实现命令本体，复刻 bash 真实 `history`
+/// 输出：
+///
+/// ```text
+///     1  echo foo
+///     2  pwd
+///     3  history
+/// ```
+///
+/// ## 格式契约（精确）
+///
+/// - 每行格式 `"{:>4}  {entry}\n"`：编号右对齐到 **4 字符宽**、紧跟 **2 空格**、
+///   再接命令原文、最后换行。
+/// - 编号从 **1** 起递增（不是 0）；entries 切片下标 `i` 对应编号 `i + 1`。
+/// - 编号宽度足够 ≥ 4 位时（如 1234 / 12345），`{:>4}` 不截断而是按实际宽度
+///   输出——与 bash 行为一致，列对齐只在 ≤ 9999 范围内严格。
+/// - 空 entries 切片：写 0 字节（与 `run_jobs` 空表行为一致）。
+///
+/// ## 信道与重定向
+///
+/// 输出全部走 `sink`（stdout），可被 `>` / `>>` / `1>` / `1>>` 重定向到文件。
+/// 本阶段无错误路径——`err_sink` / `args` 暂未使用，签名保留这两个参数位以与
+/// `run_jobs` / `run_complete` 风格对齐，便于后续阶段加入 `history N` /
+/// `history -r <file>` / `history -w <file>` 等 flag 时零调用点改动。
+///
+/// ## 数据源与 borrow 策略
+///
+/// 调用方（`main.rs` REPL 分发）从 `editor.history()` 走 `History::get(idx,
+/// SearchDirection::Forward)` 遍历收集成 `Vec<String>` 后传入本函数——
+/// 解耦 rustyline 类型依赖，便于单测构造任意切片断言格式契约；同时通过
+/// 「收集后释放借用」回避 rustyline `Editor` 同时被读 `history()` 与写
+/// `add_history_entry()` 的 borrow checker 冲突。
+pub fn run_history(
+    sink: &mut dyn Write,
+    _err_sink: &mut dyn Write,
+    _args: &[String],
+    entries: &[String],
+) -> io::Result<()> {
+    for (i, entry) in entries.iter().enumerate() {
+        writeln!(sink, "{:>4}  {}", i + 1, entry)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,6 +895,70 @@ mod tests {
         assert_eq!(allocate_job_id(&jobs), 1);
         for j in &mut jobs {
             kill_job(j);
+        }
+    }
+
+    // ---- Stage「history as a shell builtin」：run_history 格式契约用例 ----
+
+    /// 跑 `run_history` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。
+    fn invoke_history(entries: &[&str]) -> (String, String) {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        run_history(&mut sink, &mut err, &[], &owned).expect("run_history");
+        (
+            String::from_utf8(sink).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    #[test]
+    fn history_empty_entries_no_output() {
+        // 空 entries：sink / err_sink 均零字节，Ok(())
+        let (out, err) = invoke_history(&[]);
+        assert!(out.is_empty(), "空 entries 不写 stdout");
+        assert!(err.is_empty(), "空 entries 不写 stderr");
+    }
+
+    #[test]
+    fn history_single_entry_starts_at_one() {
+        // 单条：编号 1，4 字符右对齐 + 2 空格 + 命令 + \n
+        // 1 字符编号 + 3 个前导空格 = 4 宽
+        let (out, err) = invoke_history(&["echo foo"]);
+        assert_eq!(out, "   1  echo foo\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_multiple_entries_increment_from_one() {
+        // 多条：编号 1..N 递增，每行独立
+        let (out, err) = invoke_history(&["echo foo", "pwd", "history"]);
+        let expected = "   1  echo foo\n   2  pwd\n   3  history\n";
+        assert_eq!(out, expected);
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_width_alignment_at_two_digit_boundary() {
+        // ≥ 10 条触发 2 位数编号：验证 `{:>4}` 右对齐——1 位编号占 4 宽
+        // （3 前导空格 + 1 位数字），2 位编号占 4 宽（2 前导空格 + 2 位数字），
+        // 与 bash `history` 输出列对齐一致。
+        let entries: Vec<&str> = (1..=12).map(|_| "x").collect();
+        let (out, _) = invoke_history(&entries);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 12);
+        // 第 1 行：1 位数 → 3 前导空格
+        assert_eq!(lines[0], "   1  x");
+        // 第 9 行：仍是 1 位数
+        assert_eq!(lines[8], "   9  x");
+        // 第 10 行：2 位数 → 2 前导空格，命令列位置仍对齐到第 7 列
+        assert_eq!(lines[9], "  10  x");
+        assert_eq!(lines[11], "  12  x");
+        // 显式断言：编号字段 + 2 空格分隔 + 命令的列对齐
+        for line in &lines {
+            // 前 4 字符是编号区，第 5/6 字符必须是 "  "，第 7 字符开始是命令
+            assert_eq!(&line[4..6], "  ", "编号后必须紧跟 2 空格分隔");
+            assert_eq!(&line[6..], "x", "命令字段从第 7 字符开始");
         }
     }
 }

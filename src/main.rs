@@ -11,12 +11,13 @@ mod redirect;
 
 use builtins::{
     advance_job_status, render_done_jobs, retain_running_jobs, run_cd, run_complete, run_echo,
-    run_jobs, run_pwd, run_type, Job,
+    run_history, run_jobs, run_pwd, run_type, Job,
 };
 use completion::ShellHelper;
 use exec::{run_external, run_pipeline};
 use redirect::{open_err_sink, open_sink};
 use rustyline::error::ReadlineError;
+use rustyline::history::{History, SearchDirection};
 use rustyline::{Config, CompletionType, Editor};
 
 fn main() {
@@ -106,6 +107,15 @@ fn main() {
         if line.is_empty() {
             continue;
         }
+
+        // 4.5 将本行记入 rustyline 内部 history。
+        // - rustyline 14 `auto_add_history` 默认 false，必须显式调用。
+        // - 放在 `if line.is_empty()` 之后：空行不污染历史；放在 dispatch 之前：
+        //   `history` 命令自身也要出现在输出末行（与题面 example usage 一致）。
+        // - `add_history_entry` 返回 `Result<bool>`：bool 表示是否真的入栈（如启用了
+        //   `ignore_dups` 时连续重复条目会被丢弃）。本阶段不关心去重语义，错误也不
+        //   阻断 REPL（最坏只是少一条历史），用 `let _ =` 忽略返回值。
+        let _ = editor.add_history_entry(line);
 
         // 5. 词法 + 结构化解析：支持引号、转义、`>` / `1>` / `2>` 重定向、`|` pipeline 切分。
         //    解析失败（未闭合引号、孤立反斜杠、`>` 后无目标、空 pipeline 段等）打印错误后
@@ -214,6 +224,35 @@ fn main() {
                 // 借用。borrow_mut 作用域到本 match arm 结束即释放，不与外层冲突。
                 let mut view = jobs_table.borrow_mut();
                 if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args, &mut view) {
+                    eprintln!("shell: write error: {}", e);
+                }
+            }
+            "history" => {
+                // Stage「history as a shell builtin」：从 rustyline editor 内部 history
+                // 收集本会话所有条目为 Vec<String>，再调用 `run_history` 渲染。
+                //
+                // 为什么先收集再调用？
+                // - `editor.history()` 返回 `&dyn History`（trait 14.0 注释掉了 iter()）；
+                //   必须用 `History::get(idx, SearchDirection::Forward)` 逐项取出
+                //   `SearchResult { entry: Cow<str>, .. }`。
+                // - 收集到 owned `Vec<String>` 后立即 drop 借用，`run_history` 拿到
+                //   `&[String]` 自然解耦 rustyline 类型，便于单测覆盖格式契约。
+                //
+                // 错误处理：
+                // - `History::get` 返回 `rustyline::Result<Option<SearchResult>>`，
+                //   非命中场景理论上不会出现（idx 在 0..len() 范围内），但防御性用
+                //   `if let Ok(Some(sr))` 静默跳过异常项，避免单条 history 故障
+                //   阻断整条命令。
+                // - 写 sink 失败（`>` 重定向目标盘满等）按既有 builtin 风格 eprintln!
+                //   到原始 stderr，不阻断 REPL。
+                let h = editor.history();
+                let mut entries: Vec<String> = Vec::with_capacity(h.len());
+                for i in 0..h.len() {
+                    if let Ok(Some(sr)) = h.get(i, SearchDirection::Forward) {
+                        entries.push(sr.entry.into_owned());
+                    }
+                }
+                if let Err(e) = run_history(&mut *sink, &mut *err_sink, args, &entries) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
