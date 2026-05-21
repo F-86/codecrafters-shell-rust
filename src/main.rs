@@ -228,6 +228,40 @@ fn main() {
                 }
             }
             "history" => {
+                // Stage「history -r <path>」：先嗅探 `-r <path>` 子命令，命中则从文件
+                // 按行追加历史到 rustyline Editor 内部 history 栈，完成后直接 continue，
+                // 不进入下方渲染路径（`-r` 路径无 stdout/stderr 输出）。
+                //
+                // 决策依据：
+                // - `run_history` 拿到的是 `&[String]` 只读视图，无法向 Editor 写入；
+                //   `-r` 与「渲染列表」职责正交，混入会破坏 SRP 并污染单测可达性，
+                //   因此把 `-r` 留在 dispatch 层（这里有 `editor: &mut`）。
+                // - 入栈顺序：`history -r <path>` 这条命令本身已在 dispatch 前
+                //   （main 第 118 行 `editor.add_history_entry(line)`）入栈，因此
+                //   它的编号严格小于文件条目，与题面期望 `1 history -r ... / 2 echo hello`
+                //   完全匹配。
+                //
+                // 边界处理（与用户澄清一致）：
+                // - 空行：`BufRead::lines()` 已剥离换行，`s.is_empty()` 跳过，不污染编号。
+                // - 文件不存在 / 无权限 / 单行读失败：静默忽略，不写 stderr、不阻断 REPL。
+                // - 多余参数：仅取 `args.get(1)` 作路径，`args[2..]` 静默忽略
+                //   （与既有 `history N extra` 风格一致）。
+                // - 缺路径（仅 `-r` 无第二参）：`args.get(1)` 返回 None，静默 continue。
+                if args.first().map(|s| s.as_str()) == Some("-r") {
+                    if let Some(path) = args.get(1) {
+                        if let Ok(file) = std::fs::File::open(path) {
+                            use std::io::BufRead;
+                            let reader = std::io::BufReader::new(file);
+                            for line in reader.lines().flatten() {
+                                if !line.is_empty() {
+                                    let _ = editor.add_history_entry(line);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Stage「history as a shell builtin」：从 rustyline editor 内部 history
                 // 收集本会话所有条目为 Vec<String>，再调用 `run_history` 渲染。
                 //
