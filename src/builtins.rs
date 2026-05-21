@@ -483,34 +483,51 @@ pub fn run_jobs(
     Ok(())
 }
 
-/// `history` 内建：列出本次 shell 会话已执行过的命令历史。
+/// `history` 内建：列出本次 shell 会话已执行过的命令历史，可选限制末尾 N 条。
 ///
-/// codecrafters「history as a shell builtin」阶段：本 stage tester 只验证
-/// `type history` 输出 `history is a shell builtin`（由 `run_type` + `BUILTINS`
-/// 自动覆盖），但既然分发到本函数就一并实现命令本体，复刻 bash 真实 `history`
-/// 输出：
+/// codecrafters「history as a shell builtin」+「history N」两阶段累积实现。
+/// 复刻 bash 真实 `history` 输出，无参数全列出，`history N` 只显示末尾 N 条：
 ///
 /// ```text
-///     1  echo foo
-///     2  pwd
-///     3  history
+/// $ echo first
+/// $ echo second
+/// $ history 2
+///     2  echo second
+///     3  history 2
 /// ```
 ///
 /// ## 格式契约（精确）
 ///
 /// - 每行格式 `"{:>4}  {entry}\n"`：编号右对齐到 **4 字符宽**、紧跟 **2 空格**、
 ///   再接命令原文、最后换行。
-/// - 编号从 **1** 起递增（不是 0）；entries 切片下标 `i` 对应编号 `i + 1`。
-/// - 编号宽度足够 ≥ 4 位时（如 1234 / 12345），`{:>4}` 不截断而是按实际宽度
-///   输出——与 bash 行为一致，列对齐只在 ≤ 9999 范围内严格。
-/// - 空 entries 切片：写 0 字节（与 `run_jobs` 空表行为一致）。
+/// - 编号从 **1** 起递增。**关键**：当截取末尾 N 条时，编号仍是该条目在完整
+///   history 中的**全局位置**（不是窗口局部下标 + 1）。例如 4 条历史 + `history 2`
+///   输出编号 `3` 和 `4`，而非 `1` 和 `2`——这是 bash 行为，也是本函数最易写错点。
+/// - 编号宽度 ≥ 5 位（如 12345）时，`{:>4}` 不截断而是按实际宽度输出，与 bash 一致。
+/// - 空输出（`entries` 空 / `n == 0`）：写 0 字节。
+///
+/// ## 参数语义
+///
+/// `args` 是已剥离命令名 `history` 的剩余 tokens（由 `main.rs` dispatch 提供）：
+///
+/// - `args` 为空 → 等价 `n = entries.len()`，全列出
+/// - `args[0]` 解析为 `usize` 成功（值 `n`）→ 截取末尾 `min(n, len)` 条：
+///   - `n == 0` → 0 字节输出
+///   - `n >= len` → 等价全列出（`saturating_sub` 自动覆盖）
+///   - `args[1..]` 静默忽略（对齐 bash：`history 1 2 3` 等价 `history 1`）
+/// - `args[0]` 解析失败（非数字、负数 `-5`、空串等）→ 向 `err_sink` 写
+///   `"history: {arg}: numeric argument required\n"` 后早返回 `Ok(())`，**不阻断 REPL**
+///
+/// 选用 `usize::from_str` 一举覆盖所有非法形态（负数因有符号字符自动失败），
+/// 与 bash「numeric argument required」错误语义天然对齐。
 ///
 /// ## 信道与重定向
 ///
-/// 输出全部走 `sink`（stdout），可被 `>` / `>>` / `1>` / `1>>` 重定向到文件。
-/// 本阶段无错误路径——`err_sink` / `args` 暂未使用，签名保留这两个参数位以与
-/// `run_jobs` / `run_complete` 风格对齐，便于后续阶段加入 `history N` /
-/// `history -r <file>` / `history -w <file>` 等 flag 时零调用点改动。
+/// - 正常列表输出走 `sink`（stdout），可被 `>` / `>>` / `1>` / `1>>` 重定向
+/// - 非法参数错误走 `err_sink`（stderr），可被 `2>` / `2>>` 重定向
+/// - 错误路径写 `err_sink` 失败时用 `let _ =` 吞掉：避免与「非法参数」语义重叠
+///   造成 `main.rs` 兜底的 `eprintln! shell: write error` 双重输出（沿用
+///   `run_jobs` / `run_cd` 风格）
 ///
 /// ## 数据源与 borrow 策略
 ///
@@ -521,12 +538,36 @@ pub fn run_jobs(
 /// `add_history_entry()` 的 borrow checker 冲突。
 pub fn run_history(
     sink: &mut dyn Write,
-    _err_sink: &mut dyn Write,
-    _args: &[String],
+    err_sink: &mut dyn Write,
+    args: &[String],
     entries: &[String],
 ) -> io::Result<()> {
-    for (i, entry) in entries.iter().enumerate() {
-        writeln!(sink, "{:>4}  {}", i + 1, entry)?;
+    // 1. 解析 args[0] 为 usize；无参数等价 n = len（全列出）
+    //    `usize::from_str` 对负数 / 非数字 / 空串均失败 —— 与 bash
+    //    「numeric argument required」错误语义天然对齐
+    let n = if let Some(arg) = args.first() {
+        match arg.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                // 错误写 err_sink 失败也不阻断 REPL：吞掉 IO 错误，早返回 Ok
+                let _ = writeln!(err_sink, "history: {}: numeric argument required", arg);
+                return Ok(());
+            }
+        }
+    } else {
+        entries.len()
+    };
+
+    // 2. 单一表达式覆盖 n=0 / n>=len / n<len 三种边界：
+    //    - n=0      → start = len    → 切片为空 → 0 行输出
+    //    - n>=len   → start = 0      → 全列出
+    //    - n<len    → start = len-n  → 末尾 n 条
+    let start = entries.len().saturating_sub(n);
+
+    // 3. 编号必须用全局下标 `start + i + 1`（不是 `i + 1`）：
+    //    bash 语义下 `history N` 显示的编号是条目在完整 history 中的位置。
+    for (i, entry) in entries[start..].iter().enumerate() {
+        writeln!(sink, "{:>4}  {}", start + i + 1, entry)?;
     }
     Ok(())
 }
@@ -960,5 +1001,79 @@ mod tests {
             assert_eq!(&line[4..6], "  ", "编号后必须紧跟 2 空格分隔");
             assert_eq!(&line[6..], "x", "命令字段从第 7 字符开始");
         }
+    }
+
+    // ---- Stage「history N」：args 参数化的语义契约用例 ----
+
+    /// 带 args 版的 `run_history` 薄封装：返回 (stdout, stderr) 便于断言。
+    /// 与 `invoke_history` 并存而非合并：保留无参数路径的单测可读性。
+    fn invoke_history_with_args(entries: &[&str], args: &[&str]) -> (String, String) {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let owned_entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        let owned_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        run_history(&mut sink, &mut err, &owned_args, &owned_entries).expect("run_history");
+        (
+            String::from_utf8(sink).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    #[test]
+    fn history_with_n_smaller_than_len_uses_global_numbering() {
+        // 4 条 history + `history 2` → 输出末 2 条但编号是 3/4（全局位置）
+        // 这是本阶段最易写错的点：必须用 start+i+1 而非 i+1
+        let (out, err) = invoke_history_with_args(&["a", "b", "c", "d"], &["2"]);
+        assert_eq!(out, "   3  c\n   4  d\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_with_n_zero_no_output() {
+        // n=0：start=len，切片为空，0 字节输出
+        let (out, err) = invoke_history_with_args(&["a", "b"], &["0"]);
+        assert!(out.is_empty(), "n=0 不写 stdout");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_with_n_greater_than_len_full_list() {
+        // n>=len：saturating_sub 返回 0，等价无参数全列
+        let (out, err) = invoke_history_with_args(&["a", "b"], &["99"]);
+        assert_eq!(out, "   1  a\n   2  b\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_with_n_equal_to_len_full_list() {
+        // n=len：start=0，全列出，编号 1..=len
+        let (out, err) = invoke_history_with_args(&["a", "b", "c"], &["3"]);
+        assert_eq!(out, "   1  a\n   2  b\n   3  c\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn history_non_numeric_arg_writes_stderr() {
+        // 非数字参数 → err_sink 写错误，sink 空，函数仍 Ok（REPL 不阻断）
+        let (out, err) = invoke_history_with_args(&["a"], &["abc"]);
+        assert!(out.is_empty(), "非法参数不写 stdout");
+        assert_eq!(err, "history: abc: numeric argument required\n");
+    }
+
+    #[test]
+    fn history_negative_arg_writes_stderr() {
+        // 负数 "-5" 走 usize::from_str 解析失败 → 同样 numeric required 错误
+        let (out, err) = invoke_history_with_args(&["a"], &["-5"]);
+        assert!(out.is_empty());
+        assert_eq!(err, "history: -5: numeric argument required\n");
+    }
+
+    #[test]
+    fn history_extra_args_uses_first_only() {
+        // 多余参数静默忽略（对齐 bash）：`history 2 ignored junk` 等价 `history 2`
+        let (out, err) =
+            invoke_history_with_args(&["a", "b", "c"], &["2", "ignored", "junk"]);
+        assert_eq!(out, "   2  b\n   3  c\n");
+        assert!(err.is_empty());
     }
 }
