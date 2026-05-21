@@ -47,7 +47,9 @@ impl JobStatus {
 /// 单个后台作业的元信息。
 ///
 /// 字段与题面「Tracking Background Jobs」四要素一一对应：
-/// - `id`：作业编号（`[N]` 中的 N），从 1 起递增；由 `next_job_id` 计数器分配；
+/// - `id`：作业编号（`[N]` 中的 N）。Stage「Recycling Job Numbers」起，
+///   由 [`allocate_job_id`] 在每次后台 spawn 时基于当前作业表计算「最小可用正整数」
+///   （表空→1、`[1,3]`→2、`[2,3]`→1），不再单调递增；
 /// - `pid`：子进程 PID（`Command::spawn` 返回的 `Child::id()`，`u32`）；
 /// - `command`：命令字符串，本阶段用 `parsed.argv.join(" ")`（zsh 风格、无尾 `&`、
 ///   无重定向片段）。题面明示「trailing `&` 是可选的」，tester 容忍；
@@ -341,6 +343,31 @@ pub fn render_done_jobs(sink: &mut dyn Write, jobs: &[Job]) -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// 分配下一个后台作业编号：返回当前 `jobs` 表中**最小未被占用**的正整数。
+///
+/// codecrafters「Recycling Job Numbers」阶段语义：
+/// - 表空 → `1`
+/// - `[1, 2]` → `3`（无间隙时仍是「下一个」）
+/// - `[1, 3]` → `2`（中间间隙优先复用）
+/// - `[2, 3]` → `1`（首位空缺也复用）
+///
+/// 设计要点：
+/// - **纯函数、无副作用**：仅查询 `jobs` 切片，不修改任何状态。
+///   作业编号不再由独立计数器持有——`jobs_table` 是唯一权威，
+///   分配是它的派生函数。这彻底消除「计数器与表脱节」的双源真理风险。
+/// - **算法**：线性扫描 `(1u32..)` 返回首个不在 `jobs.iter().map(|j| j.id)` 集合中的值。
+///   最坏 O(n²)（n = 表长），但本阶段后台作业表典型 ≤ 几十项，
+///   常量因子极小，远低于 `Command::spawn` 的毫秒级成本，YAGNI 不引入 HashSet。
+/// - **空表 → 1**：`(1u32..)` 首次循环 `n=1`，闭包 `!jobs.iter().any(...)`
+///   在空表上恒为 `true`，直接返回 1，无需特判。
+/// - **`unwrap` 安全**：u32 上界 4G，作业表实际不可能填满；
+///   理论上 `(1u32..)` 是有限范围，但实践中不可达。
+pub fn allocate_job_id(jobs: &[Job]) -> u32 {
+    (1u32..)
+        .find(|n| !jobs.iter().any(|j| j.id == *n))
+        .expect("allocate_job_id: u32 range exhausted (unreachable)")
 }
 
 /// 一次性 retain 移除作业表中所有 `Done` 项。
@@ -747,6 +774,57 @@ mod tests {
         retain_running_jobs(&mut jobs);
         assert_eq!(jobs.len(), 1);
 
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    // ---- Stage「Recycling Job Numbers」：allocate_job_id 最小可用分配契约 ----
+
+    #[test]
+    fn allocate_empty_table_returns_one() {
+        // 表空 → 1：`(1u32..).find(...)` 首次循环 n=1，空表上 any() 恒为 false，
+        // 闭包返回 true，命中。
+        let jobs: Vec<Job> = Vec::new();
+        assert_eq!(allocate_job_id(&jobs), 1);
+    }
+
+    #[test]
+    fn allocate_sequential_after_running_jobs() {
+        // [1, 2] → 3：无间隙时返回「下一个」编号，与单调递增计数器在该场景下等价。
+        let mut jobs = vec![
+            spawn_running_job(1, "sleep 30"),
+            spawn_running_job(2, "sleep 30"),
+        ];
+        assert_eq!(allocate_job_id(&jobs), 3);
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    #[test]
+    fn allocate_reuse_smallest_gap() {
+        // [1, 3] → 2：中间间隙优先复用，复刻题面示例「if you have jobs [1] and [3]
+        // running, the next job gets [2], not [4]」。
+        let mut jobs = vec![
+            spawn_running_job(1, "sleep 30"),
+            spawn_running_job(3, "sleep 30"),
+        ];
+        assert_eq!(allocate_job_id(&jobs), 2);
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    #[test]
+    fn allocate_reuse_after_first_removed() {
+        // [2, 3] → 1：首位空缺也回收。复刻 tester 流程 A 中
+        // 「全部完成 + reap 移除 + 表空」之外的另一边界——表非空但 1 号空缺。
+        let mut jobs = vec![
+            spawn_running_job(2, "sleep 30"),
+            spawn_running_job(3, "sleep 30"),
+        ];
+        assert_eq!(allocate_job_id(&jobs), 1);
         for j in &mut jobs {
             kill_job(j);
         }

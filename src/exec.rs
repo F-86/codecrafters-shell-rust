@@ -50,7 +50,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
-use crate::builtins::{find_in_path, Job, JobStatus};
+use crate::builtins::{allocate_job_id, find_in_path, Job, JobStatus};
 use crate::parser::ParsedCommand;
 use crate::redirect::open_file_for_redirect;
 
@@ -63,13 +63,19 @@ use crate::redirect::open_file_for_redirect;
 /// - `parsed`：完整解析结果，提供 stdout/stderr 重定向元信息与 `background` 标志；
 /// - `sink` / `err_sink`：本轮已打开的写句柄。**所有权由调用方移交给本函数**——
 ///   在 spawn 子进程前 `drop` 掉，避免与子进程对同一文件 fd 产生竞态。
-/// - `next_job_id`：跨 REPL 循环存活的后台任务编号计数器。**仅在后台分支 spawn 成功后
-///   `+= 1`**；前台分支与 spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job
-///   编号的行为一致）。
 /// - `jobs_table`：跨 REPL 存活的后台作业表共享句柄（`Rc<RefCell<Vec<Job>>>`）。
 ///   仅在后台分支 spawn 成功后 `borrow_mut().push(Job{...})`；前台分支与 spawn 失败
-///   时不触碰此表。push 使用**当前** `next_job_id`（递增之前），确保表内 `job.id`
-///   与通知行 `[N] PID` 中的 N 严格一致。
+///   时不触碰此表。
+///
+///   Stage「Recycling Job Numbers」起，作业编号改由 [`allocate_job_id`] 基于
+///   当前表内容计算「最小可用正整数」（表空→1、`[1,3]`→2、`[2,3]`→1），
+///   不再持有独立计数器——`jobs_table` 是唯一权威，分配是它的派生函数。
+///   通知行 `[N] PID` 与 `Job.id` 共享同一 `let id = allocate_job_id(...)` 局部，
+///   保证两处严格一致。
+///
+///   RefCell 借用规则：先 `let id = allocate_job_id(&jobs_table.borrow());`
+///   （临时不可变借用，语句末即 drop），再 `jobs_table.borrow_mut().push(...)`，
+///   两段借用区间不重叠，无双借 panic。
 ///
 /// 关键路径注释：
 /// - sink 走的是 `Box<dyn Write>` 抽象，运行时无法把它「拆回」具体类型，
@@ -90,7 +96,6 @@ pub fn run_external(
     parsed: &ParsedCommand,
     sink: Box<dyn Write>,
     mut err_sink: Box<dyn Write>,
-    next_job_id: &mut u32,
     jobs_table: &Rc<RefCell<Vec<Job>>>,
 ) {
     let Some(path) = find_in_path(cmd) else {
@@ -140,7 +145,7 @@ pub fn run_external(
         // - `Child` 被 drop 不触发 wait（Rust 默认实现），子进程作为孤儿存活；
         // - 通知走父进程 stdout（`println!`），不复用已 drop 的 sink——这与 bash
         //   一致：job 控制信息不被用户 `>` 重定向捕获到文件；
-        // - spawn 失败按既有路径走 `command not found`，**不**递增 next_job_id。
+        // - spawn 失败按既有路径走 `command not found`，**不**触发任何 jobs_table 写入。
         //
         // Stage「Background Job Output」语义锁定：进入此分支时 `stdio` / `err_stdio`
         // 在无重定向情况下已是 `Stdio::inherit()`（见上方 L71-90），spawn 时通过 dup2
@@ -150,12 +155,17 @@ pub fn run_external(
         match command.spawn() {
             Ok(child) => {
                 let pid = child.id();
+                // Stage「Recycling Job Numbers」：基于 jobs_table 当前内容算「最小可用」
+                // 正整数作为本次后台作业编号。表空→1、`[1,3]`→2、`[2,3]`→1。
+                // 借用即用即释放——`jobs_table.borrow()` 是临时表达式，语句末
+                // drop，确保下方 `borrow_mut()` 不与之重叠（无 RefCell 双借 panic）。
+                let id = allocate_job_id(&jobs_table.borrow());
                 // 通知行格式严格 `[<job>] <pid>\n`，方括号紧贴数字，单空格分隔。
                 // 失败（stdout 被关闭等罕见情形）静默吞掉，不阻断 REPL。
-                let _ = writeln!(std::io::stdout(), "[{}] {}", *next_job_id, pid);
-                // 入表：使用当前（递增前的）`next_job_id` 作为 Job.id，与通知行
-                // `[N] PID` 中的 N 严格一致。command 字符串用 `parsed.argv.join(" ")`
-                // 风格（无尾 `&`、无重定向片段，zsh 风格，tester 容忍）。
+                let _ = writeln!(std::io::stdout(), "[{}] {}", id, pid);
+                // 入表：使用同一 `id` 局部，与通知行 `[N] PID` 中的 N 严格一致。
+                // command 字符串用 `parsed.argv.join(" ")` 风格（无尾 `&`、无重定向片段，
+                // zsh 风格，tester 容忍）。
                 //
                 // Stage「Manage Jobs」：`child` 句柄 move 进 Job 字段，由 jobs_table
                 // 持有跨 REPL 存活。后续 `reap_finished_jobs` 用 `Child::try_wait()`
@@ -163,13 +173,12 @@ pub fn run_external(
                 // Job drop 时 Child 随之 drop。`try_wait` 已对退出子进程完成 reap，
                 // 因此 `Child::drop` 默认不 wait 也不会留下僵尸。
                 jobs_table.borrow_mut().push(Job {
-                    id: *next_job_id,
+                    id,
                     pid,
                     command: parsed.argv.join(" "),
                     status: JobStatus::Running,
                     child,
                 });
-                *next_job_id += 1;
             }
             Err(_) => {
                 eprintln!("{}: command not found", line);

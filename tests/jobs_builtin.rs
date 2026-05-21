@@ -555,3 +555,295 @@ fn done_appears_before_next_prompt() {
     drop(shell_stdin);
     drop(guard);
 }
+
+// ---------------------------------------------------------------------------
+// Stage「Recycling Job Numbers」端到端：作业编号回收（最小可用正整数分配）。
+// 复刻 codecrafters tester 的两条核心流程：
+//   - 流程 A：作业表清空后下个 `&` 命令必须从 [1] 重新开始；
+//   - 流程 B：单条作业完成 + 自动 reap 后下个 `&` 命令复用刚释放的编号。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recycle_to_one_when_empty() {
+    // tester 流程 A 端到端复刻：
+    //   $ cat <fifo> &        → [1] <pid>
+    //   # 写 fifo + EOF 让 cat 退出
+    //   $ echo apple          → "apple\n" + 自动 reap 渲染 [1]+ Done
+    //   $ sleep 100 &         → 必须打印 [1] <pid>（编号回收为 1，不是 2）
+    //   $ jobs                → [1]+  Running                 sleep 100 &
+    //
+    // 关键断言：
+    // - `sleep 100 &` 之后、下一个哨兵之前，窗口内必须出现 `[1] ` 通知子串；
+    // - 后续 `jobs` 窗口必须含 `[1]+  Running` + `sleep 100`。
+    //
+    // 用哨兵 `END_SENTINEL_<N>` 切窗口，避免最初 `cat <fifo> &` 的 `[1]` 通知
+    // 干扰对「回收后新通知」的断言——只检查 END_SENTINEL_2..END_SENTINEL_3 区间。
+
+    // 0. 创建唯一 FIFO
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fifo_path = std::env::temp_dir().join(format!(
+        "shell_recycle_empty_{}_{}.fifo",
+        std::process::id(),
+        now
+    ));
+    let mkfifo_status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(mkfifo_status.success(), "mkfifo failed: {:?}", fifo_path);
+
+    // 1. spawn shell
+    let bin = env!("CARGO_BIN_EXE_codecrafters-shell");
+    let shell = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shell binary");
+
+    let mut guard = Cleanup {
+        shell: Some(shell),
+        fifos: vec![fifo_path.clone()],
+    };
+    let shell = guard.shell.as_mut().unwrap();
+    let mut shell_stdin = shell.stdin.take().expect("shell stdin");
+    let shell_stdout = shell.stdout.take().expect("shell stdout");
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut reader = shell_stdout;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let fifo_str = fifo_path.to_str().expect("fifo path utf8");
+    let mut acc = String::new();
+
+    // ---- 步骤 1：cat <fifo> & 启动 [1] + 哨兵 END1 ----
+    shell_stdin
+        .write_all(format!("cat {} &\n", fifo_str).as_bytes())
+        .expect("write cat bg");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_1\n")
+        .expect("write sentinel 1");
+    shell_stdin.flush().expect("flush 1");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_1"], Duration::from_secs(5));
+
+    // ---- 步骤 2：写 fifo + close 让 cat 退出 + 等 reap ----
+    {
+        let _w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo_path)
+            .expect("open fifo for write");
+    }
+    thread::sleep(Duration::from_millis(400));
+
+    // 喂 echo apple → 触发下一轮 prompt 前自动 reap 渲染 `[1]+ Done` + 哨兵 END2。
+    // END2 之后表已空，下一条 `sleep 100 &` 必须分配编号 1。
+    shell_stdin.write_all(b"echo apple\n").expect("write echo");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_2\n")
+        .expect("write sentinel 2");
+    shell_stdin.flush().expect("flush 2");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_2"], Duration::from_secs(5));
+
+    // ---- 步骤 3：表空 → sleep 100 & 必须打印 `[1] <pid>` ----
+    shell_stdin
+        .write_all(b"sleep 100 &\n")
+        .expect("write sleep bg");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin.write_all(b"jobs\n").expect("write jobs");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_3\n")
+        .expect("write sentinel 3");
+    shell_stdin.flush().expect("flush 3");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_3"], Duration::from_secs(5));
+
+    // 第三步窗口：END2..END3 之间必须出现回收后的 `[1] ` 通知 + jobs `[1]+  Running`
+    let region3 = {
+        let start = acc.find("END_SENTINEL_2").unwrap_or(0);
+        let end = acc.find("END_SENTINEL_3").unwrap_or(acc.len());
+        acc[start..end].to_string()
+    };
+    // 通知行：`[1] <pid>`（数字 + 空格 + pid）。用 `[1] ` 子串足以排他匹配——
+    // jobs 行格式是 `[1]+  ` 或 `[1]-  `（mark 后必有 2 空格），二者 `[1] ` 后
+    // 紧跟数字 PID，与 jobs 行的 mark 字符 `+`/`-`/` ` 不同。但通知行后跟数字
+    // PID，jobs 行后跟空白 mark 也可能匹配 `[1] `——用更精确判定：通知行起始
+    // 于行首 `[1] ` 后接数字。
+    let has_notify = region3.lines().any(|l| {
+        l.strip_prefix("[1] ")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty())
+    });
+    assert!(
+        has_notify,
+        "sleep 100 & 必须打印 `[1] <pid>` 通知（编号回收为 1）；窗口:\n{}",
+        region3
+    );
+    assert!(
+        region3.contains("[1]+  Running") && region3.contains("sleep 100"),
+        "jobs 窗口必须含 `[1]+  Running` + `sleep 100`；窗口:\n{}",
+        region3
+    );
+
+    drop(shell_stdin);
+    drop(guard);
+}
+
+#[test]
+fn reuse_two_with_one_remaining() {
+    // tester 流程 B 端到端复刻：
+    //   $ sleep 100 &         → [1] <pid>
+    //   $ cat <fifo> &        → [2] <pid>
+    //   # 写 fifo + EOF 让 cat 退出
+    //   $ echo word           → "word\n" + 自动 reap 渲染 [2]+ Done
+    //   # 表只剩 [1] sleep 100；最小可用是 2
+    //   $ sleep 50 &          → 必须打印 [2] <pid>（编号回收为 2，不是 3）
+    //   $ jobs                → [1]-  Running                 sleep 100 &
+    //                          [2]+  Running                 sleep 50 &
+    //
+    // 关键断言：
+    // - 步骤 3 窗口内必须出现 `[2] <pid>` 通知（编号回收）；
+    // - jobs 窗口必须同时含 `[1]-  Running` + `sleep 100` 与 `[2]+  Running` + `sleep 50`。
+
+    // 0. 创建唯一 FIFO
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fifo_path = std::env::temp_dir().join(format!(
+        "shell_recycle_two_{}_{}.fifo",
+        std::process::id(),
+        now
+    ));
+    let mkfifo_status = Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("spawn mkfifo");
+    assert!(mkfifo_status.success(), "mkfifo failed: {:?}", fifo_path);
+
+    // 1. spawn shell
+    let bin = env!("CARGO_BIN_EXE_codecrafters-shell");
+    let shell = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shell binary");
+
+    let mut guard = Cleanup {
+        shell: Some(shell),
+        fifos: vec![fifo_path.clone()],
+    };
+    let shell = guard.shell.as_mut().unwrap();
+    let mut shell_stdin = shell.stdin.take().expect("shell stdin");
+    let shell_stdout = shell.stdout.take().expect("shell stdout");
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut reader = shell_stdout;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let fifo_str = fifo_path.to_str().expect("fifo path utf8");
+    let mut acc = String::new();
+
+    // ---- 步骤 1：sleep 100 & ([1]) + cat <fifo> & ([2]) + 哨兵 END1 ----
+    shell_stdin
+        .write_all(b"sleep 100 &\n")
+        .expect("write sleep bg");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin
+        .write_all(format!("cat {} &\n", fifo_str).as_bytes())
+        .expect("write cat bg");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_1\n")
+        .expect("write sentinel 1");
+    shell_stdin.flush().expect("flush 1");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_1"], Duration::from_secs(5));
+
+    // ---- 步骤 2：让 [2] cat 退出 + 等自动 reap，再 echo word + 哨兵 END2 ----
+    {
+        let _w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo_path)
+            .expect("open fifo for write");
+    }
+    thread::sleep(Duration::from_millis(400));
+
+    shell_stdin.write_all(b"echo word\n").expect("write echo");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_2\n")
+        .expect("write sentinel 2");
+    shell_stdin.flush().expect("flush 2");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_2"], Duration::from_secs(5));
+
+    // ---- 步骤 3：表只剩 [1]，下条 sleep 50 & 必须分配编号 2 ----
+    shell_stdin
+        .write_all(b"sleep 50 &\n")
+        .expect("write sleep 50 bg");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin.write_all(b"jobs\n").expect("write jobs");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_3\n")
+        .expect("write sentinel 3");
+    shell_stdin.flush().expect("flush 3");
+    drain_until(&rx, &mut acc, &["END_SENTINEL_3"], Duration::from_secs(5));
+
+    let region3 = {
+        let start = acc.find("END_SENTINEL_2").unwrap_or(0);
+        let end = acc.find("END_SENTINEL_3").unwrap_or(acc.len());
+        acc[start..end].to_string()
+    };
+
+    // 步骤 3 窗口必须出现回收后的 `[2] <pid>` 通知（行首 `[2] ` + 数字 PID）
+    let has_notify = region3.lines().any(|l| {
+        l.strip_prefix("[2] ")
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty())
+    });
+    assert!(
+        has_notify,
+        "sleep 50 & 必须打印 `[2] <pid>` 通知（编号回收为 2，非 3）；窗口:\n{}",
+        region3
+    );
+    // jobs 输出：[1] 是 last-1（`-`）、[2] 是 last（`+`）；marker 算法基于 Vec 索引，
+    // 与既有 `jobs_mixed_running_and_done_retain_only_running` 单测语义一致。
+    assert!(
+        region3.contains("[1]-  Running") && region3.contains("sleep 100"),
+        "jobs 窗口必须含 `[1]-  Running` + `sleep 100`；窗口:\n{}",
+        region3
+    );
+    assert!(
+        region3.contains("[2]+  Running") && region3.contains("sleep 50"),
+        "jobs 窗口必须含 `[2]+  Running` + `sleep 50`；窗口:\n{}",
+        region3
+    );
+
+    drop(shell_stdin);
+    drop(guard);
+}

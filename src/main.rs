@@ -49,18 +49,18 @@ fn main() {
 
     editor.set_helper(Some(ShellHelper::new(completions.clone())));
 
-    // 后台任务编号计数器：跨 REPL 循环存活，从 1 起递增。
-    // 仅在 `run_external` 的后台分支 spawn 成功后 `+= 1`；前台分支与
-    // spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job 编号一致）。
-    // 本阶段单线程串行 REPL 无需 `Rc<RefCell<...>>`，`&mut u32` 直接传参即可。
-    let mut next_job_id: u32 = 1;
-
     // 后台作业表：跨 REPL 循环存活，记录已 spawn 但尚未回收的 Job。
     // 用 `Rc<RefCell<Vec<Job>>>` 复刻 `completions` 注册表风格：
     // - 写端 `run_external`（后台 spawn 成功后 push）；
     // - 读端 `run_jobs`（遍历列出）；
     // - 为未来 SIGCHLD 异步回收（reaper 线程或 signalfd）预留共享路径。
     // 单线程 REPL 串行节奏天然不并发借用。
+    //
+    // Stage「Recycling Job Numbers」：作业编号不再持有独立 `next_job_id` 计数器——
+    // `run_external` 后台分支 spawn 成功后调 `allocate_job_id(&jobs_table.borrow())`
+    // 计算「最小可用正整数」（表空→1、`[1,3]`→2、`[2,3]`→1）。`jobs_table` 是
+    // 唯一权威，分配是它的派生函数，自动 reap 移除 Done 项后下一条后台命令立刻
+    // 看到清理后的表。
     let jobs_table: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
 
     loop {
@@ -203,7 +203,7 @@ fn main() {
                 }
             }
             _ => {
-                run_external(cmd, line, args, &parsed, sink, err_sink, &mut next_job_id, &jobs_table);
+                run_external(cmd, line, args, &parsed, sink, err_sink, &jobs_table);
             }
         }
     }
