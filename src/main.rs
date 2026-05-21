@@ -9,7 +9,7 @@ mod exec;
 mod parser;
 mod redirect;
 
-use builtins::{run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type, Job};
+use builtins::{reap_finished_jobs, run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type, Job};
 use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
@@ -61,6 +61,13 @@ fn main() {
     let jobs_table: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
 
     loop {
+        // Stage「Manage Jobs」：每轮 prompt 前对 jobs_table 中所有 Running 项做一次
+        // 非阻塞 `Child::try_wait()` 探测，把已退出的子进程标记为 Done 并完成 reap。
+        // 与 bash 行为对齐——只在用户准备输入下一条命令前推进状态，不开后台线程，
+        // 不依赖信号处理。`borrow_mut()` 作用域严格收敛在单语句内，绝不跨越下方
+        // `editor.readline()`（后者会阻塞，跨越将导致后续 dispatch borrow 时 panic）。
+        reap_finished_jobs(&mut jobs_table.borrow_mut());
+
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
         let line = match editor.readline("$ ") {
             Ok(s) => s,
@@ -166,10 +173,12 @@ fn main() {
                 }
             }
             "jobs" => {
-                // 本阶段：列出唯一的运行中后台作业。借出 `&[Job]` 切片传给 run_jobs；
-                // borrow 作用域到本 match arm 结束即释放，不与 dispatch 后续路径冲突。
-                let view = jobs_table.borrow();
-                if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args, &view) {
+                // Stage「Manage Jobs」：`run_jobs` 入口再做一次 reap（防御性兜底，
+                // 覆盖 `cat <fifo> &` 后立即写 fifo 再立即 `jobs` 这种 prompt 间隔
+                // 被压缩的边界场景），随后渲染并 retain 移除 Done 项；故需要 `&mut`
+                // 借用。borrow_mut 作用域到本 match arm 结束即释放，不与外层冲突。
+                let mut view = jobs_table.borrow_mut();
+                if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args, &mut view) {
                     eprintln!("shell: write error: {}", e);
                 }
             }

@@ -9,9 +9,11 @@
 //!
 //! 当 [`ParsedCommand::background`] 为 `true` 时，本函数走「后台路径」：用
 //! [`Command::spawn`] 启动子进程后**不调 `wait`/`status`**，立即向父进程 stdout
-//! 打印 `[<job>] <pid>` 通知并返回。子进程的 [`Child`] 句柄被 `drop`——Rust 默认
-//! 实现下 `Child::drop` 不会 `wait` 子进程，子进程作为孤儿存活，由 init 接管，
-//! 与题面 C 示例「fork+exec 不 waitpid」语义对齐。
+//! 打印 `[<job>] <pid>` 通知，并把 [`Child`] 句柄 move 进 [`Job`] 字段、入
+//! `jobs_table` 持有，然后返回。后续由主循环 prompt 前与 `run_jobs` 入口的
+//! `reap_finished_jobs` 通过 `Child::try_wait()` 非阻塞推进状态——退出后的子进程
+//! 由 try_wait 完成 reap，无僵尸残留；仍在运行的子进程其 Child 句柄保留在 Job
+//! 中，与 bash 作业控制语义对齐。
 //!
 //! 通知行 `[N] PID` 走父进程 stdout（直接 `println!`），**不复用** `sink`——
 //! 这与 bash 真实行为一致：job 控制信息属于 shell 自身的元信息，不应被用户的
@@ -154,16 +156,20 @@ pub fn run_external(
                 // 入表：使用当前（递增前的）`next_job_id` 作为 Job.id，与通知行
                 // `[N] PID` 中的 N 严格一致。command 字符串用 `parsed.argv.join(" ")`
                 // 风格（无尾 `&`、无重定向片段，zsh 风格，tester 容忍）。
+                //
+                // Stage「Manage Jobs」：`child` 句柄 move 进 Job 字段，由 jobs_table
+                // 持有跨 REPL 存活。后续 `reap_finished_jobs` 用 `Child::try_wait()`
+                // 非阻塞推进状态，`run_jobs` 渲染 Done 后由 `Vec::retain` 移除——
+                // Job drop 时 Child 随之 drop。`try_wait` 已对退出子进程完成 reap，
+                // 因此 `Child::drop` 默认不 wait 也不会留下僵尸。
                 jobs_table.borrow_mut().push(Job {
                     id: *next_job_id,
                     pid,
                     command: parsed.argv.join(" "),
                     status: JobStatus::Running,
+                    child,
                 });
                 *next_job_id += 1;
-                // `child` 在此处 drop——Rust `Child::drop` 默认不 wait，符合
-                // 「fork+exec 不 waitpid」语义。
-                drop(child);
             }
             Err(_) => {
                 eprintln!("{}: command not found", line);

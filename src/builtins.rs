@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Child;
 
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
@@ -18,13 +19,17 @@ pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete",
 
 /// 后台作业状态。
 ///
-/// 本阶段（codecrafters「list a single background job」）仅需要 `Running` 一个变体——
-/// 题面 Notes 明示「detecting when jobs exit will come in later stages」。
-/// `Done` / `Stopped` 等状态留待后续阶段加入；此 enum 故意保留扩展空间但**不**预先
-/// 实现 SIGCHLD reap 机制，避免过早设计。
+/// 本阶段（codecrafters「Manage Jobs」/ 完成态回收）：
+/// - `Running`：进程仍存活，`Child::try_wait()` 返回 `Ok(None)`；
+/// - `Done`：进程已正常退出，`Child::try_wait()` 返回 `Ok(Some(_))`，或
+///   防御性地把 `Err(_)`（极罕见，如已被外部 reap 导致 ECHILD）也视为 Done。
+///
+/// `Done` 在 `run_jobs` 渲染一次后立即从作业表中 `retain` 移除，与 bash 行为一致。
+/// `Stopped` / 信号终止等状态不在本阶段范围内，故意保留 enum 扩展空间。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     Running,
+    Done,
 }
 
 impl JobStatus {
@@ -34,6 +39,7 @@ impl JobStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             JobStatus::Running => "Running",
+            JobStatus::Done => "Done",
         }
     }
 }
@@ -45,20 +51,24 @@ impl JobStatus {
 /// - `pid`：子进程 PID（`Command::spawn` 返回的 `Child::id()`，`u32`）；
 /// - `command`：命令字符串，本阶段用 `parsed.argv.join(" ")`（zsh 风格、无尾 `&`、
 ///   无重定向片段）。题面明示「trailing `&` 是可选的」，tester 容忍；
-/// - `status`：当前状态，本阶段恒为 `Running`。
+/// - `status`：当前状态（`Running` / `Done`）；
+/// - `child`：`std::process::Child` 句柄，本阶段用于 `try_wait()` 非阻塞探测进程
+///   是否已退出。move 进 Job 后由 Vec 持有，Job 被 `retain` 移除时随之 drop——
+///   `try_wait` 成功收尾后无僵尸残留。
 ///
-/// 不存 `started_at` / `exit_code` / `Child` 句柄等——本阶段无需 reap，留作未来扩展。
+/// 注：因为 `Child` 既不 `Clone` 也不 `Debug`，本结构去除了 `#[derive(Debug, Clone)]`。
+/// 本阶段无 Debug 输出与克隆依赖，无需手写 impl。
 ///
 /// `pid` 在本阶段不参与 `jobs` 行内输出（题面格式未要求 PID 列），但保留字段以便
 /// 后续阶段 `jobs -l` flag 与 SIGCHLD reap 路径直接复用；`#[allow(dead_code)]`
 /// 显式抑制本阶段编译警告。
-#[derive(Debug, Clone)]
 pub struct Job {
     pub id: u32,
     #[allow(dead_code)]
     pub pid: u32,
     pub command: String,
     pub status: JobStatus,
+    pub child: Child,
 }
 
 /// 按 PATH 顺序查找可执行文件。
@@ -257,27 +267,61 @@ pub fn run_complete(
     }
 }
 
-/// `jobs` 内建：列出当前 shell 已知的、仍在运行的后台作业。
+/// 非阻塞推进作业表中所有 `Running` 项的状态。
 ///
-/// codecrafters 阶段「list a single background job」要求按 bash 兼容格式输出：
+/// 实现细节：对每个 `Running` 项调用 `Child::try_wait()`（`waitpid(WNOHANG)` 风格）：
+/// - `Ok(Some(_))`：子进程已退出，标记为 `Done`；`Child` 内部已被 reap，无僵尸；
+/// - `Ok(None)`：仍存活，保持 `Running`；
+/// - `Err(_)`：极罕见（如已被外部信号处理器 reap 导致 ECHILD），防御性视为 `Done`，
+///   避免僵尸或卡死表项。
+///
+/// 调用时机：
+/// 1. REPL 主循环 `editor.readline` 之前——更接近 bash 行为，让 prompt 出现前
+///    完成态作业的状态推进；
+/// 2. `run_jobs` 入口——兜底，覆盖 prompt 间隔被压缩的边界场景（如 `cat fifo &`
+///    后立即向 fifo 写入再立即 `jobs`）。
+///
+/// 本函数仅推进状态，不删除任何条目；删除职责由 `run_jobs` 在渲染后的 `retain` 完成。
+pub fn reap_finished_jobs(jobs: &mut [Job]) {
+    for job in jobs.iter_mut() {
+        if job.status != JobStatus::Running {
+            continue;
+        }
+        match job.child.try_wait() {
+            Ok(Some(_)) => job.status = JobStatus::Done,
+            Ok(None) => {} // 仍存活
+            Err(_) => job.status = JobStatus::Done,
+        }
+    }
+}
+
+/// `jobs` 内建：列出当前 shell 已知的、仍在运行或刚刚完成的后台作业。
+///
+/// codecrafters「Manage Jobs」阶段要求按 bash 兼容格式输出已完成作业一次，
+/// 然后从作业表中移除：
 ///
 /// ```text
-/// [1]+  Running                 sleep 10
+/// [1]+  Running                 sleep 10 &
+/// [1]+  Done                    cat /tmp/fifo
 /// ```
 ///
 /// ## 格式契约（精确）
 ///
-/// 单条作业一行，格式 `"[{id}]{mark}  {status:<24}{cmd}\n"`：
+/// 单条作业一行，格式 `"[{id}]{mark}  {status:<24}{cmd}{tail}\n"`：
 /// - `[<id>]`：方括号紧贴 job 编号，无空格
 /// - `<mark>`：`+` 表示**最近一个**后台作业，`-` 表示次新，更早的作业无标记。
-///   bash 真实行为下「最近作业」即作业表中最后一条；本阶段单作业场景下唯一一条
-///   恒为 `+`，但实现已按多作业规则前向兼容（`idx == len-1` → `+`，`idx == len-2`
-///   → `-`，其余 → 空格占位以保持列对齐）
 /// - **2 个空格**分隔 mark 与 status 字段
-/// - `status` 字段总宽 **24 字符**（`{:<24}` 左对齐填充）：`"Running"` 7 字符 +
-///   17 个空格 = 24
-/// - `cmd`：命令字符串，本阶段用 `parsed.argv.join(" ")` 风格（无尾 `&`、无重定向
-///   片段，zsh 风格，tester 容忍）
+/// - `status` 字段总宽 **24 字符**（`{:<24}` 左对齐填充）：
+///   - `"Running"` 7 字符 + 17 空格 = 24
+///   - `"Done"` 4 字符 + 20 空格 = 24
+/// - `cmd`：命令字符串，本阶段用 `parsed.argv.join(" ")` 风格（无尾 `&`、无重定向片段）
+/// - `tail`：`Running` 行追加 `" &"`（与 bash 行为一致），`Done` 行不追加
+///
+/// ## 一次性移除（Done 行）
+///
+/// 渲染完毕后单次 `Vec::retain(|j| j.status != Done)` 一次性删除所有 `Done` 项；
+/// `Child` 已被 `try_wait` 成功收尾，随 Job 从 Vec 中 drop 时无僵尸残留。
+/// 下一次 `jobs` 调用不再列出该项。
 ///
 /// ## 信道与重定向语义
 ///
@@ -285,19 +329,25 @@ pub fn run_complete(
 /// 本阶段无错误路径——遍历空表也只是 0 行输出，不向 `err_sink` 写任何字节。
 /// `args` 暂未使用（题面未规定 flag），保留参数位以与 `run_type` / `run_complete`
 /// 签名风格对齐，便于后续阶段加入 `jobs -l` 等 flag 时零调用点改动。
+///
+/// 注：本函数同时承担「入口处再次 reap」的兜底职责，确保即便 prompt 前 reap
+/// 未触发也能在 `jobs` 时即时反映状态变化。
 pub fn run_jobs(
     sink: &mut dyn Write,
     _err_sink: &mut dyn Write,
     _args: &[String],
-    jobs: &[Job],
+    jobs: &mut Vec<Job>,
 ) -> io::Result<()> {
+    // 入口处再次 reap：覆盖「prompt 前 reap → 立即 jobs」之间的边界窗口
+    reap_finished_jobs(jobs);
+
     if jobs.is_empty() {
         return Ok(());
     }
     let last_idx = jobs.len() - 1;
     for (idx, job) in jobs.iter().enumerate() {
         // mark 计算：最近作业 `+`，次新 `-`，更早 ` ` 占位。
-        // 本阶段单作业场景下 idx == last_idx == 0，恒为 `+`。
+        // 渲染顺序使用「retain 之前」的索引，与 bash 在单作业完成场景下的输出一致。
         let mark = if idx == last_idx {
             '+'
         } else if idx + 1 == last_idx {
@@ -307,15 +357,23 @@ pub fn run_jobs(
         };
         // 一次性 writeln! 写整行——避免分多次 write 在 `>` 重定向下被其他写入
         // 穿插造成字节顺序问题。`{:<24}` 左对齐填充到 24 字符总宽。
+        // Running 行追加 " &"（与 bash 行为一致），Done 行不追加。
+        let tail = match job.status {
+            JobStatus::Running => " &",
+            JobStatus::Done => "",
+        };
         writeln!(
             sink,
-            "[{}]{}  {:<24}{}",
+            "[{}]{}  {:<24}{}{}",
             job.id,
             mark,
             job.status.as_str(),
-            job.command
+            job.command,
+            tail,
         )?;
     }
+    // 一次性移除所有 Done：Child 已 reap，drop 即无残留
+    jobs.retain(|j| j.status != JobStatus::Done);
     Ok(())
 }
 
@@ -383,10 +441,56 @@ mod tests {
         assert!(err.is_empty(), "-p 命中不写 stderr");
     }
 
-    // ---- Stage「list a single background job」：run_jobs 格式契约用例 ----
+    // ---- Stage「Manage Jobs」：run_jobs 格式契约 + reap 行为用例 ----
+
+    /// 构造一个仍在运行的 Job：spawn `sleep 30`，长存活足够覆盖测试窗口。
+    /// 用例结束时由 RAII guard 兜底 `kill` + `wait`，避免子进程残留。
+    fn spawn_running_job(id: u32, command: &str) -> Job {
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        let pid = child.id();
+        Job {
+            id,
+            pid,
+            command: command.to_string(),
+            status: JobStatus::Running,
+            child,
+        }
+    }
+
+    /// 构造一个已退出但尚未 reap 的 Job：spawn `true`，主动 `wait()` 让进程退出。
+    /// 注意：此处直接调 `wait` 让进程退出并 reap，但状态仍标记 Running——
+    /// 这模拟 reap_finished_jobs 调用前的初始态。
+    /// 由于 `wait` 会消费内部 ExitStatus，后续 `try_wait` 在已 reap 的子进程上
+    /// 会返回 `Err(ECHILD)` —— 这正好命中「Err 视为 Done」防御性分支。
+    /// 真实场景下走的是 `try_wait` 的 `Ok(Some(_))` 分支（进程退出但未被 wait），
+    /// 此处用 `true` + `wait` 仅为单测可控性；reap 推进的语义等价。
+    fn spawn_exited_job(id: u32, command: &str) -> Job {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        // 阻塞等子进程退出 + reap，确保 try_wait 之后必然返回 Err 或 Ok(Some)
+        let _ = child.wait();
+        let pid = child.id();
+        Job {
+            id,
+            pid,
+            command: command.to_string(),
+            status: JobStatus::Running,
+            child,
+        }
+    }
+
+    /// 杀掉 Running Job 的 child，避免测试遗留。Done Job 已被 reap，无需处理。
+    fn kill_job(job: &mut Job) {
+        let _ = job.child.kill();
+        let _ = job.child.wait();
+    }
 
     /// 跑 `run_jobs` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。
-    fn invoke_jobs(jobs: &[Job]) -> (String, String) {
+    fn invoke_jobs(jobs: &mut Vec<Job>) -> (String, String) {
         let mut sink: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
         run_jobs(&mut sink, &mut err, &[], jobs).expect("run_jobs");
@@ -398,33 +502,27 @@ mod tests {
 
     #[test]
     fn jobs_single_running_exact_format() {
-        // 题面 tester 唯一场景：单作业、Running、`+` 标记、24 宽 status 填充
-        let jobs = vec![Job {
-            id: 1,
-            pid: 84470,
-            command: "sleep 10".to_string(),
-            status: JobStatus::Running,
-        }];
-        let (out, err) = invoke_jobs(&jobs);
-        // 完整逐字节匹配：`[1]+` + 2 空格 + "Running" + 17 空格 + "sleep 10\n"
-        assert_eq!(out, "[1]+  Running                 sleep 10\n");
+        // 题面 tester 场景：单作业、Running、`+` 标记、24 宽 status 填充、尾 `&`
+        let mut jobs = vec![spawn_running_job(1, "sleep 10")];
+        let (out, err) = invoke_jobs(&mut jobs);
+        // 完整逐字节匹配：`[1]+` + 2 空格 + "Running" + 17 空格 + "sleep 10 &\n"
+        assert_eq!(out, "[1]+  Running                 sleep 10 &\n");
         assert!(err.is_empty(), "jobs 不向 stderr 写字节");
+        // Running 不被 retain 移除
+        assert_eq!(jobs.len(), 1);
+        for j in &mut jobs {
+            kill_job(j);
+        }
     }
 
     #[test]
     fn jobs_status_field_padded_to_24_chars() {
         // 显式验证：mark 后的 2 空格分隔之后，status + 填充共 24 字符宽，紧接 cmd
-        let jobs = vec![Job {
-            id: 1,
-            pid: 1,
-            command: "x".to_string(),
-            status: JobStatus::Running,
-        }];
-        let (out, _) = invoke_jobs(&jobs);
-        // 行格式：`[1]+  ` (6 字节) + status_field (24 字节) + "x\n"
-        // 计算 status_field 起止：从 "  " 之后到 "x" 之前
+        let mut jobs = vec![spawn_running_job(1, "x")];
+        let (out, _) = invoke_jobs(&mut jobs);
+        // 行格式：`[1]+  ` (6 字节) + status_field (24 字节) + "x &\n"
         let prefix = "[1]+  ";
-        let suffix = "x\n";
+        let suffix = "x &\n";
         assert!(out.starts_with(prefix));
         assert!(out.ends_with(suffix));
         let status_field = &out[prefix.len()..out.len() - suffix.len()];
@@ -432,46 +530,59 @@ mod tests {
         assert!(status_field.starts_with("Running"));
         // 7 字符 "Running" + 17 空格 = 24
         assert_eq!(&status_field[7..], &" ".repeat(17));
+        for j in &mut jobs {
+            kill_job(j);
+        }
     }
 
     #[test]
     fn jobs_empty_table_no_output() {
         // 空作业表：sink / err_sink 均零字节，Ok(())
-        let (out, err) = invoke_jobs(&[]);
+        let mut jobs: Vec<Job> = Vec::new();
+        let (out, err) = invoke_jobs(&mut jobs);
         assert!(out.is_empty(), "空表不写 stdout");
         assert!(err.is_empty(), "空表不写 stderr");
     }
 
     #[test]
-    fn jobs_multi_marker_plus_minus_space() {
-        // 多作业前向兼容验证：最近 `+`、次新 `-`、更早空格占位
-        // 本阶段 tester 不测，但 mark 计算逻辑需自洽避免未来阶段返工
-        let jobs = vec![
-            Job {
-                id: 1,
-                pid: 100,
-                command: "a".to_string(),
-                status: JobStatus::Running,
-            },
-            Job {
-                id: 2,
-                pid: 200,
-                command: "b".to_string(),
-                status: JobStatus::Running,
-            },
-            Job {
-                id: 3,
-                pid: 300,
-                command: "c".to_string(),
-                status: JobStatus::Running,
-            },
+    fn jobs_done_renders_without_trailing_amp_and_retained_out() {
+        // 已退出作业：reap 推进至 Done，渲染一次（无尾 `&`、24 宽 Done），
+        // 渲染后从 Vec 中移除——再调一次 invoke_jobs 即空输出。
+        let mut jobs = vec![spawn_exited_job(1, "true")];
+        let (out, err) = invoke_jobs(&mut jobs);
+        // Done 行：`[1]+` + 2 空格 + "Done" + 20 空格 + "true\n"（无尾 `&`）
+        assert_eq!(out, "[1]+  Done                    true\n");
+        assert!(err.is_empty());
+        // retain 后 Vec 为空
+        assert!(jobs.is_empty(), "Done 项渲染后必须被一次性移除");
+        // 再次调用：无任何输出
+        let (out2, err2) = invoke_jobs(&mut jobs);
+        assert!(out2.is_empty(), "二次 jobs 不再列出已 Done 项");
+        assert!(err2.is_empty());
+    }
+
+    #[test]
+    fn jobs_mixed_running_and_done_retain_only_running() {
+        // 混合：一条 Running + 一条 Done。渲染两行，retain 后仅留 Running。
+        // 注意构造顺序：先 Running 再 Done，则 last_idx 指向 Done（idx=1 → `+`），
+        // Running（idx=0）为次新 → `-`。
+        let mut jobs = vec![
+            spawn_running_job(1, "sleep 10"),
+            spawn_exited_job(2, "true"),
         ];
-        let (out, _) = invoke_jobs(&jobs);
+        let (out, _) = invoke_jobs(&mut jobs);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3);
-        // idx=0 → 空格（最早），idx=1 → `-`（次新），idx=2 → `+`（最近）
-        assert!(lines[0].starts_with("[1]   "), "最早作业空格占位: {:?}", lines[0]);
-        assert!(lines[1].starts_with("[2]-  "), "次新作业 `-`: {:?}", lines[1]);
-        assert!(lines[2].starts_with("[3]+  "), "最近作业 `+`: {:?}", lines[2]);
+        assert_eq!(lines.len(), 2);
+        // idx=0 Running → `-`、尾 ` &`
+        assert_eq!(lines[0], "[1]-  Running                 sleep 10 &");
+        // idx=1 Done → `+`、无尾 `&`
+        assert_eq!(lines[1], "[2]+  Done                    true");
+        // retain 后仅剩 Running
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 1);
+        assert_eq!(jobs[0].status, JobStatus::Running);
+        for j in &mut jobs {
+            kill_job(j);
+        }
     }
 }
