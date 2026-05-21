@@ -515,7 +515,12 @@ fn extract_arg_prefix(line_to_pos: &str) -> Option<String> {
     if line_to_pos.chars().next_back().map_or(true, |c| c.is_whitespace()) {
         return Some(String::new());
     }
-    let tokens = tokenize(line_to_pos).ok()?;
+    // tokenize 第二参 vars：补全期不接入 shell 变量后端——用户键入 `$V<TAB>` 时
+    // 期望补全的是变量名本身（或其后续命令），而不是「先把 `$V` 展开成空串再
+    // 据空 prefix 列出全部 entry」。本阶段 tester 不覆盖 `$VAR` 与补全的交互，
+    // 故传空表保持现状；未来若要支持补全期展开，需改为 `Rc::clone(&shell_vars)`
+    // 让 ShellHelper 持有读端引用，并按 bash 语义进一步抉择「展开 vs 字面」。
+    let tokens = tokenize(line_to_pos, &HashMap::new()).ok()?;
     tokens.into_iter().last()
 }
 
@@ -663,7 +668,8 @@ fn extract_completer_context(line_to_pos: &str) -> Option<CompleterContext> {
         return None;
     }
     // 2. tokenize（失败 → None，由外层回退到文件名补全的静默路径）
-    let tokens = tokenize(line_to_pos).ok()?;
+    //    第二参 vars 传空表的理由：详见 `extract_arg_prefix` 内同位调用注释。
+    let tokens = tokenize(line_to_pos, &HashMap::new()).ok()?;
     if tokens.is_empty() {
         return None;
     }

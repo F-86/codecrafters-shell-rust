@@ -6,6 +6,8 @@
 //! 每段独立保留 `>` / `>>` / `2>` / `2>>` 语义；末尾 `&` 仅作用于整条 pipeline。
 //! [`parse`] 保留为单命令兼容 wrapper（内部调 `parse_pipeline` 后断言 stages.len()==1）。
 
+use std::collections::HashMap;
+
 use super::tokenize::tokenize;
 use super::ParseError;
 
@@ -135,8 +137,11 @@ fn collect_redirects(tokens: Vec<String>) -> Result<ParsedCommand, ParseError> {
 /// 在 token 层与 pipeline 分隔符无区别——但本阶段 tokenize 内部对引号态守护严格，
 /// `|` 仅在 Normal 态被识别为独立 token，引号内字面 `|` 被合并进引号 token 内不会出现
 /// 为单独 `"|"`，故 pipeline 切分不会把字面量误识别为分隔符。
-pub fn parse_pipeline(input: &str) -> Result<Pipeline, ParseError> {
-    let mut tokens = tokenize(input)?;
+pub fn parse_pipeline(
+    input: &str,
+    vars: &HashMap<String, String>,
+) -> Result<Pipeline, ParseError> {
+    let mut tokens = tokenize(input, vars)?;
     // 先识别并剥离末尾 `&`：本阶段 `&` 仅作为「pipeline 整体后台」标志。
     let background = matches!(tokens.last().map(|s| s.as_str()), Some("&"));
     if background {
@@ -199,8 +204,11 @@ pub fn parse_pipeline(input: &str) -> Result<Pipeline, ParseError> {
 /// 主路径（`main.rs`）不再调用本函数——只在 `#[cfg(test)]` 路径与未来外部调用方使用，
 /// 故对非 test 编译加 `#[allow(dead_code)]` 抑制「未使用」警告。
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
-    let mut pipeline = parse_pipeline(input)?;
+pub fn parse(
+    input: &str,
+    vars: &HashMap<String, String>,
+) -> Result<ParsedCommand, ParseError> {
+    let mut pipeline = parse_pipeline(input, vars)?;
     if pipeline.stages.len() == 1 {
         let mut cmd = pipeline.stages.pop().expect("len == 1");
         cmd.background = pipeline.background;

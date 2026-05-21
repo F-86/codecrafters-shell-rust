@@ -219,10 +219,16 @@ fn main() {
         //   阻断 REPL（最坏只是少一条历史），用 `let _ =` 忽略返回值。
         let _ = editor.add_history_entry(line);
 
-        // 5. 词法 + 结构化解析：支持引号、转义、`>` / `1>` / `2>` 重定向、`|` pipeline 切分。
+        // 5. 词法 + 结构化解析：支持引号、转义、`>` / `1>` / `2>` 重定向、`|` pipeline 切分、
+        //    `$VAR` 参数展开（引号外 + 双引号内命中 `shell_vars` 的 NAME 替换为值，未命中
+        //    替换为空串；单引号内 `$` 字面保留）。
         //    解析失败（未闭合引号、孤立反斜杠、`>` 后无目标、空 pipeline 段等）打印错误后
         //    继续 REPL，不中断进程。
-        let pipeline = match parser::parse_pipeline(line) {
+        //
+        // borrow 作用域：`shell_vars.borrow()` 仅在 `parse_pipeline` 调用期间持有不可变借用，
+        // 表达式结束即 drop——下方 dispatch 中 `declare` arm 调 `shell_vars.borrow_mut()` 时
+        // 借用区间不重叠，无 RuntimeError 风险。
+        let pipeline = match parser::parse_pipeline(line, &shell_vars.borrow()) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{}", e);

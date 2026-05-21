@@ -616,23 +616,26 @@ fn escape_for_double_quote(s: &str) -> String {
 ///
 /// ## 设计决策
 ///
+/// - **基于 `parser::tokenize` 的字符级 helper 实现**：
+///   `is_name_start` / `is_name_cont` 同时被 `$VAR` 展开期 NAME 扫描和
+///   本函数复用，跨 stage 100% 同源，避免「declare 校验」与「展开 NAME 扫描」
+///   字符集分裂的隐患。
 /// - **不引入 `regex` crate**：bash 的 valid-identifier 是固定的小型
-///   状态机，手写 byte-level 扫描（`as_bytes()`）零分配、零编译开销
+///   状态机，手写字符级扫描零分配、零编译开销。
 /// - **ASCII-only 而非 Unicode 字母**：bash 默认 LANG=C 下不放行
-///   多字节 Unicode 字母，本实现刻意保持 byte 视图，与 bash 行为对齐；
-///   多字节字符首字节高位为 1，会被 `is_ascii_alphabetic` 直接拒绝
+///   多字节 Unicode 字母，本实现刻意保持字符级判定与 bash 行为对齐——
+///   `is_name_start` / `is_name_cont` 内部用 `is_ascii_alphabetic` /
+///   `is_ascii_alphanumeric` 直接拒绝多字节字符。
 /// - **零拷贝**：仅借用 `&str`，遍历过程不分配
 fn is_valid_identifier(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let Some(&first) = bytes.first() else {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
         return false; // 空串：首字符不存在 → 非法
     };
-    if !(first.is_ascii_alphabetic() || first == b'_') {
+    if !crate::parser::is_name_start(first) {
         return false;
     }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    chars.all(crate::parser::is_name_cont)
 }
 
 /// `declare` 内建：shell 变量存储 + `-p NAME` 描述打印。

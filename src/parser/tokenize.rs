@@ -1,18 +1,41 @@
 //! 词法层：把输入字符串切分为扁平 token 序列。
 //!
-//! 详见父模块 [`crate::parser`] 头注释中关于引号、转义与重定向操作符的语义说明。
+//! 详见父模块 [`crate::parser`] 头注释中关于引号、转义、重定向操作符与
+//! `$VAR` 变量展开的语义说明。
 
 use super::ParseError;
+use std::collections::HashMap;
+
+/// NAME 首字符判定：`^[A-Za-z_]`，ASCII-only。
+///
+/// 与 `is_name_cont` 一起组成 bash POSIX valid-identifier
+/// `^[A-Za-z_][A-Za-z0-9_]*$` 的字符级拆分，作为 `$VAR` 展开期 NAME
+/// 扫描和 `declare` NAME 整串校验的**同源**判定逻辑——`builtins.rs`
+/// 的 `is_valid_identifier` 也基于本对函数实现，跨 stage 100% 一致。
+pub(crate) fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+/// NAME 后续字符判定：`[A-Za-z0-9_]`，ASCII-only。
+///
+/// 与 `is_name_start` 配对使用，参见后者文档。
+pub(crate) fn is_name_cont(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
 
 /// 词法分析器内部状态。
 enum State {
-    /// 引号外：空白作分隔符，遇到 `'` / `"` 进入对应引号态。
+    /// 引号外：空白作分隔符，遇到 `'` / `"` 进入对应引号态；
+    /// 遇到 `$NAME` 触发变量展开（合法 NAME 替换为值，未命中替换为空串，
+    /// `$` 后非合法首字符则按字面量保留 `$`）。
     Normal,
-    /// 单引号内部：任何字符（除 `'`）都按字面量追加。
+    /// 单引号内部：任何字符（除 `'`）都按字面量追加；`$` 不触发展开。
     InSingleQuote,
     /// 双引号内部：除 `"` 外大多数字符按字面量追加；`\` 仅对
     /// `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义（吃掉自身），其他字符前
-    /// `\` 按字面量保留。`$` 仍按字面量，待后续阶段实现变量展开。
+    /// `\` 按字面量保留。`$NAME` 与引号外语义一致触发变量展开；`\$` 路径
+    /// 已在反斜杠分支一次性消费 `$` 并 push 字面，下一轮主循环看到的是
+    /// `$` 之后的字符，绝不会进入 `$` 展开分支——天然「字面 `$` 不展开」。
     InDoubleQuote,
 }
 
@@ -20,7 +43,13 @@ enum State {
 ///
 /// 返回的 `Vec<String>` 中每个元素对应最终传给命令的一个 argv；
 /// 相邻引号 / 空引号 / 裸字符串拼接已在内部完成。
-pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
+///
+/// `vars` 为只读 shell 变量视图，用于 `$NAME` 展开：引号外与双引号内
+/// 命中 NAME 替换为值、未命中替换为空串；单引号内 `$` 永远字面保留。
+pub fn tokenize(
+    input: &str,
+    vars: &HashMap<String, String>,
+) -> Result<Vec<String>, ParseError> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
     // 标记「当前 token 是否已经开始」：
@@ -45,6 +74,48 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                         }
                         // 行尾孤立 `\`：无字符可转义，按语法错误处理
                         None => return Err(ParseError::TrailingBackslash),
+                    }
+                }
+                '$' => {
+                    // 引号外 `$NAME` 变量展开：peek 下一字符判定是否为合法 NAME 首字符。
+                    // - 合法：贪婪扫描 NAME（`is_name_cont`），用 NAME 查 vars——
+                    //   命中 push 值、未命中 push 空串；in_token 置真（即使展开为空串
+                    //   也开启 token，与 `""` 显式空 token 行为一致）。
+                    // - 非法（数字 / `-` / 空白 / 引号 / EOF 等）：把 `$` 当字面字符
+                    //   push，进入下一轮主循环按原规则处理后续字符（即 q4 决策的
+                    //   「`$` 字面降级」：`$1abc` 字面输出、`$-` 字面输出、行尾 `$` 字面）。
+                    //
+                    // `chars.clone().next()` 是 O(1) 安全 peek（std `Chars: Clone` 仅克隆
+                    // 内部 &[u8] 指针）。
+                    if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
+                        let mut name = String::new();
+                        // 贪婪消费 NAME 字符：首字符已通过 peek 校验为 is_name_start，
+                        // 直接 chars.next() 一次性收入；后续字符循环 peek + next。
+                        while let Some(&_) = chars.clone().next().as_ref() {
+                            // 双重 peek 模式：先 clone peek 拿 char，命中 is_name_cont
+                            // 才真正 next 消费。比把 `next()` 结果存起来再判定更直观，
+                            // 且对 NAME 末尾字符的非合法判定不会误吃。
+                            if let Some(c) = chars.clone().next() {
+                                if is_name_cont(c) {
+                                    chars.next();
+                                    name.push(c);
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        // NAME 至少 1 字符（首字符已通过 peek 校验）
+                        if let Some(value) = vars.get(&name) {
+                            current.push_str(value);
+                        }
+                        // 未命中：q2 决策展开为空串（current 不追加任何字符）
+                        in_token = true;
+                    } else {
+                        // q4 决策：`$` 后非合法首字符 → `$` 按字面量降级
+                        current.push('$');
+                        in_token = true;
                     }
                 }
                 '\'' => {
@@ -154,7 +225,7 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     state = State::Normal;
                 }
                 c => {
-                    // 引号内一切字符（含空白与特殊字符，包括 `\`）按字面量保留
+                    // 引号内一切字符（含空白与特殊字符，包括 `\` 与 `$`）按字面量保留
                     current.push(c);
                 }
             },
@@ -167,9 +238,10 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     // 双引号内反斜杠：仅对 `"`、`\`、`$`、`` ` `` 这 4 个字符触发转义
                     // 并吃掉自身；其他字符前 `\` 按字面量保留（与 Normal 态「无条件
                     // 转义」的关键差异：双引号内 `\n` 是 2 字符字面量，不丢反斜杠）。
-                    // 注：`\$` 与 `` \` `` 提前到位与 bash 真实行为一致，避免后续
-                    // 变量展开阶段回头改测试。`std::str::Chars` 实现 `Clone`，
-                    // `chars.clone().next()` 是 O(1) 安全 peek。
+                    // 注：`\$` 提前消费 `$` 作为字面 push，下一轮主循环看到的是 `$`
+                    // 之后的字符（绝不再进入下方 `$` 展开分支），天然实现 bash 的
+                    // 「`\$VAR` 在双引号内不展开」语义，无需额外标记位。
+                    // `std::str::Chars` 实现 `Clone`，`chars.clone().next()` 是 O(1) 安全 peek。
                     match chars.clone().next() {
                         Some(next) if matches!(next, '"' | '\\' | '$' | '`') => {
                             chars.next(); // 消费下一字符
@@ -183,9 +255,35 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                         }
                     }
                 }
+                '$' => {
+                    // 双引号内 `$NAME` 展开：与 Normal 态分支语义完全一致，
+                    // 仅状态机所属分支不同。重复实现而非抽函数：
+                    // - 共享 `chars` / `current` / `in_token` 多个可变借用，抽函数
+                    //   会引入 5 参签名，可读性反而下降；
+                    // - 两态分支的展开行为契约对称，两份小代码块比一份带状态参数
+                    //   的函数更易跟踪与维护。
+                    if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
+                        let mut name = String::new();
+                        while let Some(c) = chars.clone().next() {
+                            if is_name_cont(c) {
+                                chars.next();
+                                name.push(c);
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some(value) = vars.get(&name) {
+                            current.push_str(value);
+                        }
+                        // 未命中：展开为空串（双引号内 token 已经 in_token=true，
+                        // 这里无需再设置 in_token——双引号开启时已置真）。
+                    } else {
+                        // 双引号内 `$` 后非合法首字符 → 字面保留 `$`
+                        current.push('$');
+                    }
+                }
                 c => {
-                    // 引号内其他字符（含空白、单引号、`$`、`*`、`;` 等）按字面量保留
-                    // 注：`$` 的变量展开语义在后续阶段实现
+                    // 引号内其他字符（含空白、单引号、`*`、`;` 等）按字面量保留
                     current.push(c);
                 }
             },
