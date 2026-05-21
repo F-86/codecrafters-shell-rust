@@ -93,6 +93,28 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     }
                     in_token = false;
                 }
+                '&' => {
+                    // 后台执行操作符 `&`：在引号外作为独立 token 切出，
+                    // 与 `>` 切分规则对称（无论前是否有空白）。
+                    //
+                    // 设计理由：若把 `&` 留给主 ch 分支当字面量，则 `sleep 30&` 会切成
+                    // `["sleep", "30&"]`，迫使 parse 层做「token 末尾字符串切分」二次解析，
+                    // 引入双重数据源。让词法层统一切出独立 `"&"` token，使 parse 层只需
+                    // 「检查并 pop 最后一个 token」即可识别后台标记，逻辑最简、无歧义。
+                    //
+                    // 引号内（InSingleQuote / InDoubleQuote）的 `&` 不会进入这里——
+                    // 那两个分支对一切非闭合字符都按字面量保留——故 `echo "&"` / `echo '&'`
+                    // 仍输出字面 `&`，不触发后台语义。引号外反斜杠转义 `\&` 同样在 Normal 态
+                    // `\\` 分支先于此分支处理，下一字符被消费为字面量，绕过本分支。
+                    //
+                    // 本阶段仅 single `&` 语义；未来扩展 `&&`（逻辑 AND）时可在此 peek
+                    // 下一字符按 `>>` 模板升级，目前保持单字符 token。
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push("&".to_string());
+                    in_token = false;
+                }
                 c if c.is_whitespace() => {
                     // 引号外空白：若已有 token 则结束之；否则跳过连续空白
                     if in_token {

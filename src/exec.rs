@@ -4,6 +4,18 @@
 //! 把这段从 REPL 主循环抽出后，`main.rs` 不再需要 `std::process::Command` / `Stdio`
 //! / `CommandExt` 等 use；外部命令未命中 PATH 时仍通过传入的 `err_sink` 写
 //! "command not found"（可被 `2>` 捕获），保持与拆分前完全一致的语义。
+//!
+//! ## 后台执行（`&` 末尾标记）
+//!
+//! 当 [`ParsedCommand::background`] 为 `true` 时，本函数走「后台路径」：用
+//! [`Command::spawn`] 启动子进程后**不调 `wait`/`status`**，立即向父进程 stdout
+//! 打印 `[<job>] <pid>` 通知并返回。子进程的 [`Child`] 句柄被 `drop`——Rust 默认
+//! 实现下 `Child::drop` 不会 `wait` 子进程，子进程作为孤儿存活，由 init 接管，
+//! 与题面 C 示例「fork+exec 不 waitpid」语义对齐。
+//!
+//! 通知行 `[N] PID` 走父进程 stdout（直接 `println!`），**不复用** `sink`——
+//! 这与 bash 真实行为一致：job 控制信息属于 shell 自身的元信息，不应被用户的
+//! `>` / `1>` 重定向捕获到文件。
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -19,9 +31,12 @@ use crate::redirect::open_file_for_redirect;
 /// - `cmd`：用户输入的命令名（用作 `argv[0]`，与 bash 行为一致——不替换为绝对路径）；
 /// - `line`：用户输入的整行原文，仅在 not-found / spawn 失败时拼接 "command not found" 错误使用；
 /// - `args`：除命令名外的参数切片；
-/// - `parsed`：完整解析结果，提供 stdout/stderr 重定向元信息；
+/// - `parsed`：完整解析结果，提供 stdout/stderr 重定向元信息与 `background` 标志；
 /// - `sink` / `err_sink`：本轮已打开的写句柄。**所有权由调用方移交给本函数**——
 ///   在 spawn 子进程前 `drop` 掉，避免与子进程对同一文件 fd 产生竞态。
+/// - `next_job_id`：跨 REPL 循环存活的后台任务编号计数器。**仅在后台分支 spawn 成功后
+///   `+= 1`**；前台分支与 spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job
+///   编号的行为一致）。
 ///
 /// 关键路径注释：
 /// - sink 走的是 `Box<dyn Write>` 抽象，运行时无法把它「拆回」具体类型，
@@ -42,6 +57,7 @@ pub fn run_external(
     parsed: &ParsedCommand,
     sink: Box<dyn Write>,
     mut err_sink: Box<dyn Write>,
+    next_job_id: &mut u32,
 ) {
     let Some(path) = find_in_path(cmd) else {
         // 未在 PATH 命中：command not found 走 err_sink（可被 `2>` 捕获）
@@ -78,12 +94,39 @@ pub fn run_external(
     drop(err_sink);
 
     // argv[0] 必须是用户输入的命令名而非完整路径（与 bash 行为一致）
-    let status = Command::new(&path)
+    let mut command = Command::new(&path);
+    command
         .arg0(cmd)
         .args(args)
         .stdout(stdio)
-        .stderr(err_stdio)
-        .status();
+        .stderr(err_stdio);
+
+    if parsed.background {
+        // 后台分支：spawn 不 wait，立即打印 `[N] PID` 通知后返回。
+        // - `Child` 被 drop 不触发 wait（Rust 默认实现），子进程作为孤儿存活；
+        // - 通知走父进程 stdout（`println!`），不复用已 drop 的 sink——这与 bash
+        //   一致：job 控制信息不被用户 `>` 重定向捕获到文件；
+        // - spawn 失败按既有路径走 `command not found`，**不**递增 next_job_id。
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                // 通知行格式严格 `[<job>] <pid>\n`，方括号紧贴数字，单空格分隔。
+                // 失败（stdout 被关闭等罕见情形）静默吞掉，不阻断 REPL。
+                let _ = writeln!(std::io::stdout(), "[{}] {}", *next_job_id, pid);
+                *next_job_id += 1;
+                // `child` 在此处 drop——Rust `Child::drop` 默认不 wait，符合
+                // 「fork+exec 不 waitpid」语义。
+                drop(child);
+            }
+            Err(_) => {
+                eprintln!("{}: command not found", line);
+            }
+        }
+        return;
+    }
+
+    // 前台分支：保持既有 `.status()` 同步等待语义不变。
+    let status = command.status();
     if status.is_err() {
         eprintln!("{}: command not found", line);
     }

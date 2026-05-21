@@ -46,6 +46,12 @@ fn main() {
 
     editor.set_helper(Some(ShellHelper::new(completions.clone())));
 
+    // 后台任务编号计数器：跨 REPL 循环存活，从 1 起递增。
+    // 仅在 `run_external` 的后台分支 spawn 成功后 `+= 1`；前台分支与
+    // spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job 编号一致）。
+    // 本阶段单线程串行 REPL 无需 `Rc<RefCell<...>>`，`&mut u32` 直接传参即可。
+    let mut next_job_id: u32 = 1;
+
     loop {
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
         let line = match editor.readline("$ ") {
@@ -160,7 +166,7 @@ fn main() {
                 }
             }
             _ => {
-                run_external(cmd, line, args, &parsed, sink, err_sink);
+                run_external(cmd, line, args, &parsed, sink, err_sink, &mut next_job_id);
             }
         }
     }
