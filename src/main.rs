@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::rc::Rc;
 
 mod builtins;
@@ -9,7 +9,10 @@ mod exec;
 mod parser;
 mod redirect;
 
-use builtins::{reap_finished_jobs, run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type, Job};
+use builtins::{
+    advance_job_status, render_done_jobs, retain_running_jobs, run_cd, run_complete, run_echo,
+    run_jobs, run_pwd, run_type, Job,
+};
 use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
@@ -61,12 +64,29 @@ fn main() {
     let jobs_table: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
 
     loop {
-        // Stage「Manage Jobs」：每轮 prompt 前对 jobs_table 中所有 Running 项做一次
-        // 非阻塞 `Child::try_wait()` 探测，把已退出的子进程标记为 Done 并完成 reap。
-        // 与 bash 行为对齐——只在用户准备输入下一条命令前推进状态，不开后台线程，
-        // 不依赖信号处理。`borrow_mut()` 作用域严格收敛在单语句内，绝不跨越下方
-        // `editor.readline()`（后者会阻塞，跨越将导致后续 dispatch borrow 时 panic）。
-        reap_finished_jobs(&mut jobs_table.borrow_mut());
+        // Stage「Reaping Before Each Prompt」：每轮 prompt 前对 jobs_table 做完整
+        // 三步原子操作——状态推进 → 渲染 Done 行到 stdout → 从作业表移除 Done。
+        // 与 bash 行为对齐：Done 行夹在「上一条命令的输出」与「下一个 prompt」之间，
+        // 用户无需主动 `jobs` 即能看到完成态。
+        //
+        // 设计要点：
+        // - **写 io::stdout()**：自动 reap 不在任何具体命令的执行上下文中，无 `>` /
+        //   `2>` 重定向语义；codecrafters tester 抓的正是 shell 进程 stdout。
+        // - **flush 必要**：rustyline 进入 raw mode 后绘制 prompt 走独立路径；
+        //   不 flush 可能导致 Done 行滞留缓冲，出现在 prompt 之后。
+        // - **错误吞掉**：写 stdout 失败已无意义渲染目标，保证 REPL 鲁棒性。
+        // - **borrow_mut 作用域**：严格收敛在 `{ }` 内，绝不跨越下方阻塞的
+        //   `editor.readline()`，否则后续 dispatch 借用 panic。
+        // - **与 `run_jobs` 共用原子函数**：advance_job_status / retain_running_jobs
+        //   是同一组实现；render_done_jobs 仅本路径调用（避免 sink + stdout 双写）。
+        {
+            let mut tbl = jobs_table.borrow_mut();
+            advance_job_status(&mut tbl);
+            let mut out = io::stdout().lock();
+            let _ = render_done_jobs(&mut out, &tbl);
+            let _ = out.flush();
+            retain_running_jobs(&mut tbl);
+        }
 
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
         let line = match editor.readline("$ ") {

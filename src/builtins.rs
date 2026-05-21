@@ -275,14 +275,11 @@ pub fn run_complete(
 /// - `Err(_)`：极罕见（如已被外部信号处理器 reap 导致 ECHILD），防御性视为 `Done`，
 ///   避免僵尸或卡死表项。
 ///
-/// 调用时机：
-/// 1. REPL 主循环 `editor.readline` 之前——更接近 bash 行为，让 prompt 出现前
-///    完成态作业的状态推进；
-/// 2. `run_jobs` 入口——兜底，覆盖 prompt 间隔被压缩的边界场景（如 `cat fifo &`
-///    后立即向 fifo 写入再立即 `jobs`）。
-///
-/// 本函数仅推进状态，不删除任何条目；删除职责由 `run_jobs` 在渲染后的 `retain` 完成。
-pub fn reap_finished_jobs(jobs: &mut [Job]) {
+/// 本函数为「Reaping Before Each Prompt」三函数原子拆分中的第一步：仅推进状态，
+/// 不渲染任何字节、不修改 Vec 长度。渲染由 [`render_done_jobs`] 承担，移除由
+/// [`retain_running_jobs`] 承担。两条调用路径（REPL prompt 前自动 reap、
+/// `run_jobs` 入口兜底）都先调本函数完成状态推进。
+pub fn advance_job_status(jobs: &mut [Job]) {
     for job in jobs.iter_mut() {
         if job.status != JobStatus::Running {
             continue;
@@ -293,6 +290,68 @@ pub fn reap_finished_jobs(jobs: &mut [Job]) {
             Err(_) => job.status = JobStatus::Done,
         }
     }
+}
+
+/// 仅渲染作业表中已 `Done` 项的标准 Done 行；不修改 Vec。
+///
+/// **关键：marker 基于「Done + 仍 Running 全集」的索引计算**——遍历完整 `&[Job]`，
+/// 对每个 idx 算 mark（`last_idx → '+'`、`last_idx-1 → '-'`、其他 → ` `），
+/// 但仅当 `status == Done` 时 `writeln!` 输出。Running 项贡献索引基线但不输出。
+/// 这复刻 bash 行为：题面示例「`sleep 5 &; sleep 100 &`，job 1 完成时输出
+/// `[1]-  Done                    sleep 5`」——彼时 job 2 是 last，job 1 是
+/// last-1 故 `-`。
+///
+/// 行格式（与 [`run_jobs`] 完全一致）：
+/// ```text
+/// [<id><mark>  Done                    <command>\n
+/// ```
+/// - mark 后 2 空格分隔
+/// - status 字段总宽 24（`{:<24}`，`"Done"` 4 字符 + 20 空格）
+/// - Done 行**不**追加尾 ` &`（与 Running 行的尾 ` &` 区分）
+///
+/// 调用方：
+/// - **REPL prompt 前自动 reap 路径**：`sink = io::stdout().lock()`，写完 flush
+///   让 Done 行先于 prompt 落盘
+/// - `run_jobs` **不**调用本函数（避免 sink + stdout 双写重复）
+///
+/// 空表 / 全 Running 时不写任何字节，返回 `Ok(())`。
+pub fn render_done_jobs(sink: &mut dyn Write, jobs: &[Job]) -> io::Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let last_idx = jobs.len() - 1;
+    for (idx, job) in jobs.iter().enumerate() {
+        if job.status != JobStatus::Done {
+            continue;
+        }
+        let mark = if idx == last_idx {
+            '+'
+        } else if idx + 1 == last_idx {
+            '-'
+        } else {
+            ' '
+        };
+        writeln!(
+            sink,
+            "[{}]{}  {:<24}{}",
+            job.id,
+            mark,
+            job.status.as_str(),
+            job.command,
+        )?;
+    }
+    Ok(())
+}
+
+/// 一次性 retain 移除作业表中所有 `Done` 项。
+///
+/// `Child` 已被 [`advance_job_status`] 中的 `try_wait` 成功收尾，drop 即无僵尸残留。
+/// 与渲染解耦——调用方需自行确保渲染（如有）已完成再调本函数；本阶段两条路径
+/// （prompt 前自动 reap、`run_jobs`）都在渲染后才调用。
+///
+/// 空表场景下 `retain` 自然 no-op。
+pub fn retain_running_jobs(jobs: &mut Vec<Job>) {
+    jobs.retain(|j| j.status != JobStatus::Done);
 }
 
 /// `jobs` 内建：列出当前 shell 已知的、仍在运行或刚刚完成的后台作业。
@@ -338,8 +397,9 @@ pub fn run_jobs(
     _args: &[String],
     jobs: &mut Vec<Job>,
 ) -> io::Result<()> {
-    // 入口处再次 reap：覆盖「prompt 前 reap → 立即 jobs」之间的边界窗口
-    reap_finished_jobs(jobs);
+    // 入口处再做一次状态推进（兜底）：覆盖「prompt 前 reap → 立即 jobs」之间的
+    // 边界窗口，与 REPL prompt 前自动 reap 路径共享同一原子函数，行为一致。
+    advance_job_status(jobs);
 
     if jobs.is_empty() {
         return Ok(());
@@ -372,8 +432,9 @@ pub fn run_jobs(
             tail,
         )?;
     }
-    // 一次性移除所有 Done：Child 已 reap，drop 即无残留
-    jobs.retain(|j| j.status != JobStatus::Done);
+    // 一次性移除所有 Done：Child 已 reap，drop 即无残留。
+    // 共用 retain_running_jobs 与自动 reap 路径保持单一移除来源。
+    retain_running_jobs(jobs);
     Ok(())
 }
 
@@ -581,6 +642,111 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, 1);
         assert_eq!(jobs[0].status, JobStatus::Running);
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    // ---- Stage「Reaping Before Each Prompt」：三函数原子拆分契约用例 ----
+
+    #[test]
+    fn advance_job_status_only_promotes_running_to_done_no_len_change() {
+        // 契约：advance_job_status 只对 Running 项调 try_wait 推进状态；
+        // 不渲染、不修改 Vec 长度；Done 项保持 Done。
+        let mut jobs = vec![
+            spawn_running_job(1, "sleep 30"),  // 仍 Running
+            spawn_exited_job(2, "true"),       // 已退出，进入函数前 status 仍是 Running
+        ];
+        let len_before = jobs.len();
+        advance_job_status(&mut jobs);
+        // len 不变
+        assert_eq!(jobs.len(), len_before);
+        // job 1 仍 Running（sleep 30 远未结束）
+        assert_eq!(jobs[0].status, JobStatus::Running);
+        // job 2 被推进为 Done（spawn_exited_job 已 wait 过，try_wait Err 命中 Done 分支）
+        assert_eq!(jobs[1].status, JobStatus::Done);
+        // 清理 Running
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    #[test]
+    fn render_done_jobs_marker_uses_union_view() {
+        // 契约：render_done_jobs 的 marker 基于「Done + Running 全集」索引计算，
+        // 仅对 Done 项 writeln，Running 项贡献索引基线但不输出。
+        //
+        // 题面示例 1 关键场景：jobs = [Done(id=1, "sleep 5"), Running(id=2, "sleep 100")]
+        // last_idx = 1 → Running；idx=0 (Done) 是 last-1 → mark 为 `-`。
+        // 期望仅渲染 1 行（Done 的）：`[1]-  Done                    sleep 5\n`
+        let mut jobs = vec![
+            spawn_exited_job(1, "sleep 5"),
+            spawn_running_job(2, "sleep 100"),
+        ];
+        // 必须先推进，否则 spawn_exited_job 的 status 还是 Running
+        advance_job_status(&mut jobs);
+        assert_eq!(jobs[0].status, JobStatus::Done);
+        assert_eq!(jobs[1].status, JobStatus::Running);
+
+        let mut sink: Vec<u8> = Vec::new();
+        render_done_jobs(&mut sink, &jobs).expect("render_done_jobs");
+        let out = String::from_utf8(sink).expect("utf8");
+        // 仅 1 行 Done，marker 是 `-`（不是 `+`），无尾 ` &`
+        assert_eq!(out, "[1]-  Done                    sleep 5\n");
+        // 不修改 Vec 长度
+        assert_eq!(jobs.len(), 2);
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    #[test]
+    fn render_done_jobs_empty_or_all_running_no_output() {
+        // 边界：空表 / 全 Running 时 render_done_jobs 不写任何字节。
+
+        // 空表
+        let jobs_empty: Vec<Job> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        render_done_jobs(&mut sink, &jobs_empty).expect("empty ok");
+        assert!(sink.is_empty(), "空表不写任何字节");
+
+        // 全 Running
+        let mut jobs = vec![
+            spawn_running_job(1, "sleep 30"),
+            spawn_running_job(2, "sleep 30"),
+        ];
+        let mut sink: Vec<u8> = Vec::new();
+        render_done_jobs(&mut sink, &jobs).expect("all running ok");
+        assert!(sink.is_empty(), "全 Running 不写任何字节");
+        for j in &mut jobs {
+            kill_job(j);
+        }
+    }
+
+    #[test]
+    fn retain_running_jobs_removes_all_done_in_one_pass() {
+        // 契约：retain_running_jobs 一次性删除所有 Done 项；保留所有非 Done。
+        let mut jobs = vec![
+            spawn_exited_job(1, "true"),
+            spawn_running_job(2, "sleep 30"),
+            spawn_exited_job(3, "true"),
+        ];
+        // 先推进，让 1/3 进入 Done
+        advance_job_status(&mut jobs);
+        assert_eq!(jobs[0].status, JobStatus::Done);
+        assert_eq!(jobs[1].status, JobStatus::Running);
+        assert_eq!(jobs[2].status, JobStatus::Done);
+
+        retain_running_jobs(&mut jobs);
+        // 仅 id=2 仍在
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 2);
+        assert_eq!(jobs[0].status, JobStatus::Running);
+
+        // 再次调用：no-op
+        retain_running_jobs(&mut jobs);
+        assert_eq!(jobs.len(), 1);
+
         for j in &mut jobs {
             kill_job(j);
         }

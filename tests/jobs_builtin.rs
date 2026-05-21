@@ -33,11 +33,13 @@ use std::time::{Duration, Instant};
 
 /// RAII 清理保证：测试 panic / 正常结束都会执行。
 ///
-/// `fifo` 字段：当 Stage「Manage Jobs」端到端测试使用 FIFO 时，guard 在 drop 时
-/// 一并 `unlink`，避免 `/tmp` 残留。`None` 时跳过——上一阶段 `sleep 10` 用例不需要 FIFO。
+/// `fifos` 字段：当端到端测试使用 FIFO 时，guard 在 drop 时一并 `unlink`，
+/// 避免 `/tmp` 残留。空 vec 时跳过——上一阶段 `sleep 10` 用例不需要 FIFO。
+/// 用 `Vec<PathBuf>` 而非 `Option<PathBuf>` 以支持「Reaping Before Each Prompt」
+/// 阶段双 FIFO 场景（一个让 cat 退出，一个保持 cat 阻塞）。
 struct Cleanup {
     shell: Option<Child>,
-    fifo: Option<PathBuf>,
+    fifos: Vec<PathBuf>,
 }
 
 impl Drop for Cleanup {
@@ -46,7 +48,7 @@ impl Drop for Cleanup {
             let _ = shell.kill();
             let _ = shell.wait();
         }
-        if let Some(path) = self.fifo.take() {
+        for path in self.fifos.drain(..) {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -65,7 +67,7 @@ fn jobs_lists_single_running_background_job() {
 
     let mut guard = Cleanup {
         shell: Some(shell),
-        fifo: None,
+        fifos: Vec::new(),
     };
     let shell = guard.shell.as_mut().unwrap();
 
@@ -220,7 +222,7 @@ fn jobs_done_then_removed() {
 
     let mut guard = Cleanup {
         shell: Some(shell),
-        fifo: Some(fifo_path.clone()),
+        fifos: vec![fifo_path.clone()],
     };
     let shell = guard.shell.as_mut().unwrap();
     let mut shell_stdin = shell.stdin.take().expect("shell stdin");
@@ -315,6 +317,18 @@ fn jobs_done_then_removed() {
         "Done 行不得以 ` &` 结尾：`{}`",
         done_line
     );
+    // Stage「Reaping Before Each Prompt」契约：Done 行在窗口内**恰好出现一次**。
+    // 自动 reap 路径与 `jobs` 内建任一先触发即渲染并移除，不得重复。
+    // 不假设具体由哪条路径渲染：本阶段后通常由 prompt 前自动 reap 抢先渲染，
+    // jobs2 看到空表无输出；但只要窗口内 Done 行恰好 1 次，契约即满足。
+    let done_count = region2.matches("[1]+  Done").count()
+        + region2.matches("[1]-  Done").count()
+        + region2.matches("[1]   Done").count();
+    assert_eq!(
+        done_count, 1,
+        "Done 行必须在 END1..END2 窗口内恰好出现一次（实测 {}）：\n{}",
+        done_count, region2
+    );
 
     // ---- 第三步：jobs3 + 哨兵 END3，期望窗口内不再含 `[1]` 作业行 ----
     shell_stdin.write_all(b"jobs\n").expect("write jobs3");
@@ -337,6 +351,207 @@ fn jobs_done_then_removed() {
     );
 
     // 4. 干净退出 shell
+    drop(shell_stdin);
+    drop(guard);
+}
+
+// ---------------------------------------------------------------------------
+// Stage「Reaping Before Each Prompt」端到端：
+// 完成态作业在 prompt 前自动渲染 Done 行（夹在前一条命令输出与下一个 prompt 之间），
+// 无需用户主动 `jobs`；marker 基于「Done + Running 全集」联合视图计算。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn done_appears_before_next_prompt() {
+    // 端到端复刻题面示例 1 关键场景：
+    //   $ cat <fifo1> &     # job 1
+    //   $ cat <fifo2> &     # job 2
+    //   # 让 job 1 退出（写 fifo1 + close 触发 EOF）
+    //   $ echo BANANA
+    //   BANANA
+    //   [1]-  Done                    cat <fifo1>      ← 注意是 `-`，不是 `+`
+    //   $
+    //   $ jobs
+    //   [2]+  Running                 cat <fifo2> &     ← 仅剩 job 2，marker 重算
+    //
+    // 验收点：
+    // - BANANA 之后、下一个哨兵之前出现 `[1]-  Done` 子串（自动 reap 由 prompt 前路径渲染）
+    // - marker 是 `-` 而非 `+`，因为彼时 job 2 仍 Running 是 last → 验证「联合视图」语义
+    // - 后续 `jobs` 仅列 `[2]+  Running`，不再含 `[1]`（已被 reap 移除）
+
+    // 0. 创建两个唯一 FIFO
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fifo1 = std::env::temp_dir().join(format!(
+        "shell_reap_prompt_{}_{}_a.fifo",
+        std::process::id(),
+        now
+    ));
+    let fifo2 = std::env::temp_dir().join(format!(
+        "shell_reap_prompt_{}_{}_b.fifo",
+        std::process::id(),
+        now
+    ));
+    for f in &[&fifo1, &fifo2] {
+        let st = Command::new("mkfifo")
+            .arg(f)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(st.success(), "mkfifo failed: {:?}", f);
+    }
+
+    // 1. spawn shell
+    let bin = env!("CARGO_BIN_EXE_codecrafters-shell");
+    let shell = Command::new(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shell binary");
+
+    let mut guard = Cleanup {
+        shell: Some(shell),
+        fifos: vec![fifo1.clone(), fifo2.clone()],
+    };
+    let shell = guard.shell.as_mut().unwrap();
+    let mut shell_stdin = shell.stdin.take().expect("shell stdin");
+    let shell_stdout = shell.stdout.take().expect("shell stdout");
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut reader = shell_stdout;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let f1 = fifo1.to_str().expect("fifo1 utf8");
+    let f2 = fifo2.to_str().expect("fifo2 utf8");
+    let mut acc = String::new();
+
+    // ---- 第一步：双 `cat &` + 哨兵 END1，确认两个作业都已 Running ----
+    shell_stdin
+        .write_all(format!("cat {} &\n", f1).as_bytes())
+        .expect("write cat fifo1");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin
+        .write_all(format!("cat {} &\n", f2).as_bytes())
+        .expect("write cat fifo2");
+    thread::sleep(Duration::from_millis(150));
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_1\n")
+        .expect("write sentinel 1");
+    shell_stdin.flush().expect("flush 1");
+
+    drain_until(&rx, &mut acc, &["END_SENTINEL_1"], Duration::from_secs(5));
+
+    // ---- 第二步：让 job 1 退出（write+close fifo1）→ 等 reap → 喂 echo BANANA + 哨兵 END2 ----
+    {
+        let _w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo1)
+            .expect("open fifo1 for write");
+        // _w drop 触发对端 cat 的 read 返回 0 → EOF → 干净退出
+    }
+    // 等 cat 退出
+    thread::sleep(Duration::from_millis(400));
+
+    shell_stdin.write_all(b"echo BANANA\n").expect("write echo");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_2\n")
+        .expect("write sentinel 2");
+    shell_stdin.flush().expect("flush 2");
+
+    drain_until(&rx, &mut acc, &["END_SENTINEL_2"], Duration::from_secs(5));
+
+    // 第二步窗口：END1..END2 之间应包含 BANANA、随后 `[1]-  Done` 自动 reap 行。
+    // 关键：marker 是 `-`（非 `+`），因为 job 2 仍 Running 是 last → 验证联合视图。
+    let region2 = {
+        let start = acc.find("END_SENTINEL_1").unwrap_or(0);
+        let end = acc.find("END_SENTINEL_2").unwrap_or(acc.len());
+        acc[start..end].to_string()
+    };
+    assert!(
+        region2.contains("BANANA"),
+        "窗口内必须包含 BANANA 输出；窗口:\n{}",
+        region2
+    );
+    assert!(
+        region2.contains("[1]-  Done"),
+        "BANANA 之后必须自动出现 `[1]-  Done`（marker 必须是 `-`，非 `+`，验证联合视图）；窗口:\n{}",
+        region2
+    );
+    // BANANA 在 Done 之前（自动 reap 发生在下一轮 prompt 前，即 BANANA 输出之后）
+    let pos_banana = region2.find("BANANA").expect("BANANA pos");
+    let pos_done = region2.find("[1]-  Done").expect("Done pos");
+    assert!(
+        pos_banana < pos_done,
+        "BANANA 必须出现在 Done 行之前；窗口:\n{}",
+        region2
+    );
+    // Done 行不带尾 ` &`
+    let done_line = region2
+        .lines()
+        .find(|l| l.contains("[1]-  Done"))
+        .expect("locate Done line");
+    assert!(
+        !done_line.ends_with(" &"),
+        "Done 行不得以 ` &` 结尾：`{}`",
+        done_line
+    );
+    // Done 命令字段含 fifo1 片段
+    assert!(
+        done_line.contains(f1),
+        "Done 行命令字段应含 fifo1 路径 `{}`；行: `{}`",
+        f1,
+        done_line
+    );
+
+    // ---- 第三步：jobs + 哨兵 END3，期望仅剩 [2]+  Running，无 [1] ----
+    shell_stdin.write_all(b"jobs\n").expect("write jobs final");
+    shell_stdin
+        .write_all(b"echo END_SENTINEL_3\n")
+        .expect("write sentinel 3");
+    shell_stdin.flush().expect("flush 3");
+
+    drain_until(&rx, &mut acc, &["END_SENTINEL_3"], Duration::from_secs(5));
+    let region3 = {
+        let start = acc.find("END_SENTINEL_2").unwrap_or(0);
+        let end = acc.find("END_SENTINEL_3").unwrap_or(acc.len());
+        acc[start..end].to_string()
+    };
+    // job 2 仍 Running，marker 重算为 `+`（reap 后仅它一项）
+    assert!(
+        region3.contains("[2]+  Running"),
+        "jobs 窗口必须含 `[2]+  Running`（marker 重算为 `+`）；窗口:\n{}",
+        region3
+    );
+    // [1] 已被 reap 移除，不得再现（任何 mark 形态）
+    assert!(
+        !region3.contains("[1]"),
+        "jobs 窗口不得再包含 `[1]`（已自动 reap 移除）；窗口:\n{}",
+        region3
+    );
+
+    // 让 job 2 也退出，避免 shell 退出后 cat 残留
+    {
+        let _w = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo2)
+            .expect("open fifo2 for write");
+    }
+
     drop(shell_stdin);
     drop(guard);
 }
