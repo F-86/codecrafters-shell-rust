@@ -30,6 +30,20 @@ pub fn open_file_for_redirect(path: &str, append: bool) -> io::Result<File> {
 ///
 /// 返回 `Box<dyn Write>` 让调用方对两种来源无感；打开失败则把错误反馈给调用方，
 /// 由 REPL 主循环统一打印到 stderr 并跳过本轮命令执行（保证 REPL 不中断）。
+///
+/// # Examples
+///
+/// ```ignore
+/// // 无重定向 → 终端 stdout
+/// let mut sink = open_sink(None, false).unwrap();
+/// writeln!(&mut *sink, "hello").unwrap();
+///
+/// // `> out` 截断写
+/// let mut sink = open_sink(Some("out"), false).unwrap();
+///
+/// // `>> log` 追加写
+/// let mut sink = open_sink(Some("log"), true).unwrap();
+/// ```
 pub fn open_sink(stdout_redirect: Option<&str>, append: bool) -> io::Result<Box<dyn Write>> {
     match stdout_redirect {
         Some(path) => Ok(Box::new(open_file_for_redirect(path, append)?)),

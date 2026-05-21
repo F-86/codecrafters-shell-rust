@@ -16,6 +16,29 @@ use super::ParseError;
 ///
 /// 当前阶段支持 stdout（`>` / `1>` / `>>` / `1>>`）与 stderr（`2>` / `2>>`）重定向；
 /// 后续阶段可在此扩展 stdin 等字段而不需调整 [`tokenize`] 与上层 REPL 的契约。
+///
+/// # Examples
+///
+/// ```ignore
+/// // `ls -la > out`
+/// ParsedCommand {
+///     argv: vec!["ls".into(), "-la".into()],
+///     stdout_redirect: Some("out".into()),
+///     stdout_append: false,
+///     stderr_redirect: None,
+///     stderr_append: false,
+///     background: false,
+/// }
+/// // `cmd 2>> err.log &`
+/// ParsedCommand {
+///     argv: vec!["cmd".into()],
+///     stdout_redirect: None,
+///     stdout_append: false,
+///     stderr_redirect: Some("err.log".into()),
+///     stderr_append: true,
+///     background: true,
+/// }
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedCommand {
     /// 命令名 + 参数（不含任何重定向操作符或目标文件 token）。
@@ -50,6 +73,22 @@ pub struct ParsedCommand {
 /// `background` 仅作用于整条 pipeline（末尾 `&`）；段内 `&` token（如 `cmd1 & | cmd2`）
 /// 不在本阶段语义内——`&` 在每段子序列内若出现于末尾会被剥离，与单命令路径行为一致，
 /// 但因为 `|` 切分逻辑把 `&` 留在前一段子序列内，行为已知简化。
+///
+/// # Examples
+///
+/// ```ignore
+/// // `cat file | wc -l`
+/// Pipeline {
+///     stages: vec![ParsedCommand { argv: vec!["cat".into(), "file".into()], .. },
+///                  ParsedCommand { argv: vec!["wc".into(), "-l".into()], .. }],
+///     background: false,
+/// }
+/// // `sleep 30 &`（单段 pipeline + 后台）
+/// Pipeline {
+///     stages: vec![ParsedCommand { argv: vec!["sleep".into(), "30".into()], .. }],
+///     background: true,
+/// }
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct Pipeline {
     pub stages: Vec<ParsedCommand>,
@@ -137,6 +176,27 @@ fn collect_redirects(tokens: Vec<String>) -> Result<ParsedCommand, ParseError> {
 /// 在 token 层与 pipeline 分隔符无区别——但本阶段 tokenize 内部对引号态守护严格，
 /// `|` 仅在 Normal 态被识别为独立 token，引号内字面 `|` 被合并进引号 token 内不会出现
 /// 为单独 `"|"`，故 pipeline 切分不会把字面量误识别为分隔符。
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::collections::HashMap;
+/// let vars = HashMap::new();
+///
+/// // 单命令
+/// let p = parse_pipeline("ls -la", &vars).unwrap();
+/// assert_eq!(p.stages.len(), 1);
+/// assert!(!p.background);
+///
+/// // 多段 pipeline
+/// let p = parse_pipeline("cat file | wc -l", &vars).unwrap();
+/// assert_eq!(p.stages.len(), 2);
+///
+/// // 重定向 + 后台
+/// let p = parse_pipeline("sleep 30 > log &", &vars).unwrap();
+/// assert!(p.background);
+/// assert_eq!(p.stages[0].stdout_redirect.as_deref(), Some("log"));
+/// ```
 pub fn parse_pipeline(
     input: &str,
     vars: &HashMap<String, String>,
