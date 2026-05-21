@@ -1083,8 +1083,13 @@ fn parse_single_command_still_works_via_compat_wrapper() {
 // 语义契约（与 plan 决策对齐）：
 // - 引号外与双引号内：`$NAME` 按字符集 `[A-Za-z_][A-Za-z0-9_]*` 贪婪匹配并查表展开。
 // - 单引号内：`$` 始终字面，不展开。
-// - 未定义变量：展开为空串（与 bash 默认 LANG=C 一致；引号外保留为空 token）。
-// - `$` 后非合法 NAME 首字符（数字 / `-` / 空白 / EOF / 引号等）：`$` 字面降级。
+// - 命中（即便值为空串）：开启 word 并 push 值；命中空值仍是显式 word，
+//   保留为空 token（区别于未命中）。
+// - 未命中：不贡献任何字符且**不开启 word**——若整个 word 完全由 unquoted
+//   未命中展开贡献，flush 时被丢弃（bash 的「null word removal」）；
+//   双引号内由引号片段开启 word，未命中仍保留为空 token。
+// - `$` 后非合法 NAME 首字符（数字 / `-` / 空白 / EOF / 引号等）：`$` 字面降级
+//   （`$` 字面字符开启 word）。
 // - 反斜杠路径优先：`\$` 在 Normal / 双引号态先被反斜杠分支吃成字面 `$`，
 //   不会触发展开分支（已由 double_quote_escapes_dollar 间接覆盖）。
 // ========================================================================
@@ -1100,11 +1105,13 @@ fn dollar_expansion_unquoted_hit() {
 }
 
 #[test]
-fn dollar_expansion_unquoted_miss_is_empty_token() {
-    // 未定义变量在引号外展开为空串，token 保留（不被过滤）
+fn dollar_expansion_unquoted_miss_drops_word() {
+    // bash「null word removal」：unquoted 未命中变量不贡献任何字符且不开启
+    // word，整个 word 完全为空时直接丢弃，不进 argv。
+    // 区别于双引号内未命中（保留为空 token，由引号片段开启 word）。
     assert_eq!(
         tokenize("echo $UNSET", &empty_vars()).unwrap(),
-        vec!["echo", ""]
+        vec!["echo"]
     );
 }
 
@@ -1240,7 +1247,9 @@ fn dollar_expansion_double_quoted_escaped_dollar_is_literal() {
 // - 引号外与双引号内：`${NAME}` 大括号边界明确，闭合后做整串 NAME 校验
 //   （字符集与 `$NAME` 同源，复用 is_name_start/is_name_cont）。
 // - 单引号内：`${X}` 整段字面，与单引号一切其他语义一致。
-// - 未命中：展开为空串（与 `$NAME` 同语义）。
+// - 命中（含值为空串）：开启 word 并 push 值；未命中：不贡献字符且不开启 word，
+//   unquoted 全空 word 在 flush 时被丢弃（bash null word removal）；
+//   双引号内由引号片段开启 word，未命中仍保留为空 token。
 // - 反斜杠：`\${X}` 在 Normal 与双引号态走反斜杠路径——`$` 被先消费为字面 push，
 //   下一轮主循环看到 `{` 字面字符，自然得到 `${X}` 字面输出（零额外代码）。
 // - 错误：未闭合 `}` → UnterminatedBraceExpansion；
@@ -1397,5 +1406,93 @@ fn brace_expansion_double_quoted_unterminated_is_error() {
     assert_eq!(
         tokenize(r#"echo "${X"#, &empty_vars()),
         Err(ParseError::UnterminatedBraceExpansion)
+    );
+}
+
+// ========================================================================
+// Null word removal 测试组（unquoted 未命中变量 → 空 word 丢弃）
+//
+// 语义契约（与 plan 决策对齐）：
+// - 「显式 word 触发器」：字面字符 / 引号开启（`'` / `"`）/ 反斜杠转义 /
+//   命中变量展开（含值为空串）/ `$` 字面降级。任一触发后 word 一旦开启，
+//   即便其余字符全为空贡献也保留为空 token。
+// - unquoted 未命中变量：不贡献字符且不开启 word；若整个 word 完全由
+//   未命中展开贡献，flush 时整个 word 被丢弃，不进 argv。
+// - 双引号内未命中：由 `"` 开启 word 后保留为空 token，行为与现有
+//   `dollar_expansion_double_quoted_miss_keeps_token` /
+//   `brace_expansion_double_quoted_miss_keeps_token` 一致，未在本组重复覆盖。
+// ========================================================================
+
+#[test]
+fn brace_expansion_unquoted_miss_alone_drops_word() {
+    // 题面 `${missing2}` 最小复现：unquoted 单独成词且未命中 → word 被丢弃
+    assert_eq!(
+        tokenize("echo ${UNSET}", &empty_vars()).unwrap(),
+        vec!["echo"]
+    );
+}
+
+#[test]
+fn brace_expansion_problem_statement_three_args_two_remain() {
+    // 题面 verbatim：`./custom_exe_1234 ${missing1}end ${existing} ${missing2}`
+    // 期望 argv = [program, "end", "existingsvalue"]——`${missing2}` 完全消失
+    let vars = vars_with(&[("existing", "existingsvalue")]);
+    assert_eq!(
+        tokenize(
+            "./custom_exe_1234 ${missing1}end ${existing} ${missing2}",
+            &vars
+        )
+        .unwrap(),
+        vec!["./custom_exe_1234", "end", "existingsvalue"]
+    );
+}
+
+#[test]
+fn dollar_expansion_unquoted_miss_followed_by_literal_token_unaffected() {
+    // unquoted 未命中后跟空白 + 字面 token：未命中 word 被丢弃，
+    // 后续 `end` 由字面字符开启独立 word，不受影响
+    assert_eq!(
+        tokenize("echo $UNSET end", &empty_vars()).unwrap(),
+        vec!["echo", "end"]
+    );
+}
+
+#[test]
+fn expansion_unquoted_consecutive_misses_drop_word() {
+    // `${U1}${U2}` 连续两个未命中拼接：整个 word 仍完全为空 → 丢弃
+    assert_eq!(
+        tokenize("echo ${U1}${U2}", &empty_vars()).unwrap(),
+        vec!["echo"]
+    );
+}
+
+#[test]
+fn expansion_unquoted_miss_with_empty_double_quote_keeps_empty_token() {
+    // `${UNSET}""`：未命中不开启 word，但紧邻的空双引号片段开启 word
+    // → 保留为空 token，对齐 bash「显式引号片段不触发 null word removal」
+    assert_eq!(
+        tokenize("echo ${UNSET}\"\"", &empty_vars()).unwrap(),
+        vec!["echo", ""]
+    );
+}
+
+#[test]
+fn expansion_unquoted_miss_with_single_quote_literal_keeps_token() {
+    // `${UNSET}'a'`：未命中不开启 word，但单引号片段贡献字面 `a`
+    // → 整个 word 内容为 `"a"`，正常保留
+    assert_eq!(
+        tokenize("echo ${UNSET}'a'", &empty_vars()).unwrap(),
+        vec!["echo", "a"]
+    );
+}
+
+#[test]
+fn expansion_unquoted_hit_empty_value_keeps_empty_token() {
+    // 命中且值为空串：仍是显式赋值的 word，应开启 word 并保留为空 token——
+    // 区别于「未命中」（None）的丢弃行为。这是 q2 决策的语义边界。
+    let vars = vars_with(&[("X", "")]);
+    assert_eq!(
+        tokenize("echo $X", &vars).unwrap(),
+        vec!["echo", ""]
     );
 }

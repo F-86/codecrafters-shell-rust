@@ -26,8 +26,10 @@ pub(crate) fn is_name_cont(c: char) -> bool {
 /// 词法分析器内部状态。
 enum State {
     /// 引号外：空白作分隔符，遇到 `'` / `"` 进入对应引号态；
-    /// 遇到 `$NAME` 触发变量展开（合法 NAME 替换为值，未命中替换为空串，
-    /// `$` 后非合法首字符则按字面量保留 `$`）。
+    /// 遇到 `$NAME` 触发变量展开（合法 NAME 命中替换为值并开启 token；
+    /// 未命中不贡献任何字符且**不开启 token**——若整个 word 完全由
+    /// unquoted 未命中展开贡献，flush 时被丢弃，对齐 bash 的
+    /// 「null word removal」；`$` 后非合法首字符则按字面量保留 `$`）。
     Normal,
     /// 单引号内部：任何字符（除 `'`）都按字面量追加；`$` 不触发展开。
     InSingleQuote,
@@ -52,9 +54,16 @@ pub fn tokenize(
 ) -> Result<Vec<String>, ParseError> {
     let mut tokens: Vec<String> = Vec::new();
     let mut current = String::new();
-    // 标记「当前 token 是否已经开始」：
+    // 标记「当前 token 是否已被显式片段开启」：
     // 用它而不是「碰到 `'` 就 push 空串」可天然支持
     // `''`、`hello''world`、`'a''b'` 这类相邻拼接，无需特殊分支。
+    //
+    // 「显式开启」的来源：字面字符 / 引号开启（`'` / `"`）/ 反斜杠转义 /
+    // 命中变量展开（`vars.get(&name)` 返回 `Some`，即便值为空串）/ `$` 字面降级。
+    // **未命中变量展开不开启 token**——使整个 word 完全由 unquoted 未命中
+    // 展开贡献且最终为空时，flush 路径（`if in_token { ... }`）自动丢弃该
+    // word，对齐 bash 的「null word removal」语义（题面：`${missing2}` 不
+    // 产生 argv）。双引号内未命中不受影响，因为 `"` 开启时 `in_token` 已置真。
     let mut in_token = false;
     let mut state = State::Normal;
     // 使用显式迭代器以便 Normal 态遇到 `\` 时主动消费下一字符
@@ -87,8 +96,11 @@ pub fn tokenize(
                     // - 其他（数字 / `-` / 空白 / 引号 / EOF 等）：把 `$` 当字面字符 push
                     //   （q4 决策的「`$` 字面降级」：`$1abc` 字面输出、`$-` 字面输出、行尾 `$` 字面）。
                     //
-                    // 命中 push 值、未命中 push 空串；in_token 置真（即使展开为空串
-                    // 也开启 token，与 `""` 显式空 token 行为一致）。
+                    // 命中（`Some`，含值为空串）：push 值并开启 `in_token`；
+                    // 未命中（`None`）：current 不追加，**且不开启 `in_token`**——
+                    // 若整个 word 完全由 unquoted 未命中展开贡献，flush 时整个
+                    // 空 word 被丢弃，对齐 bash 的「null word removal」语义。
+                    // 字面降级路径始终有字面 `$` 贡献，正常开启 `in_token`。
                     //
                     // `chars.clone().next()` 是 O(1) 安全 peek（std `Chars: Clone` 仅克隆
                     // 内部 &[u8] 指针）。
@@ -114,11 +126,16 @@ pub fn tokenize(
                         if !first_ok || !rest_ok {
                             return Err(ParseError::BadSubstitution);
                         }
+                        // 命中：push 值并开启 token（即便值为空串也开启，
+                        // 区别于「未命中」——bash 中显式赋值的空值仍是一个
+                        // 显式 word，不触发 null word removal）。
+                        // 未命中（`None`）：current 不追加任何字符，且**不开启**
+                        // `in_token`——若整个 word 完全由 unquoted 未命中展开
+                        // 贡献，flush 时被自动丢弃（null word removal）。
                         if let Some(value) = vars.get(&name) {
                             current.push_str(value);
+                            in_token = true;
                         }
-                        // 未命中：q2 决策展开为空串（current 不追加任何字符）
-                        in_token = true;
                     } else if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
                         let mut name = String::new();
                         // 贪婪消费 NAME 字符：首字符已通过 peek 校验为 is_name_start，
@@ -138,12 +155,14 @@ pub fn tokenize(
                                 break;
                             }
                         }
-                        // NAME 至少 1 字符（首字符已通过 peek 校验）
+                        // NAME 至少 1 字符（首字符已通过 peek 校验）。
+                        // 命中 / 未命中开启 token 的语义同 `${NAME}` 分支：
+                        // 仅命中时 `in_token = true`；未命中不开启 word，
+                        // 使 unquoted 全空 word 在 flush 时被丢弃。
                         if let Some(value) = vars.get(&name) {
                             current.push_str(value);
+                            in_token = true;
                         }
-                        // 未命中：q2 决策展开为空串（current 不追加任何字符）
-                        in_token = true;
                     } else {
                         // q4 决策：`$` 后非合法首字符 → `$` 按字面量降级
                         current.push('$');
