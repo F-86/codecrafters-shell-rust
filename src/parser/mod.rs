@@ -13,6 +13,13 @@
 //! - 引号外 `$NAME` 触发变量展开：合法 NAME（`^[A-Za-z_][A-Za-z0-9_]*`）贪婪扫描
 //!   到第一个非合法字符为止，命中 `vars` 替换为值、未命中替换为空串；`$` 后非
 //!   合法首字符（如 `$1abc` / `$-` / `$<空白>` / 行尾孤立 `$`）按字面量保留 `$`；
+//! - 引号外与双引号内还支持 `${NAME}` 大括号形式：扫描到 `}` 闭合后对内部字符串
+//!   做整串 NAME 校验（同 `$NAME` 字符集，与 `is_name_start`/`is_name_cont` 同源），
+//!   命中替换为值、未命中替换为空串。大括号边界明确，可让 `${X}end` 拼接字面 `end`
+//!   而无需空白分隔。错误形式：内部 NAME 非法（空 `${}`、首字符非法 `${1abc}`、
+//!   含非 NAME 字符 `${X-Y}` 等）→ `BadSubstitution`；行尾未见闭合 `}` →
+//!   `UnterminatedBraceExpansion`。`\${X}` 在 Normal 与双引号态均复用反斜杠路径——
+//!   `$` 被先消费为字面 push，下一轮主循环看到 `{` 字面字符，自然得到 `${X}` 字面输出；
 //! - 引号外连续空白作为 token 分隔符并被折叠；
 //! - 任意相邻的引号串 / 空引号 / 裸字符串 / 转义字符可无缝拼接成同一个 argument；
 //! - 引号外 `>` 与 `1>` / `2>` 被识别为独立 token：当且仅当 `>` 紧贴在裸字符 `1` 或 `2`
@@ -97,6 +104,14 @@ pub enum ParseError {
     /// （如 `ls | | cat` 或 `a || b`）。本阶段不实现 `||` 逻辑 OR，连续 `|` 一律视为
     /// 空 stage 报错；未来如需支持 `||` 可在 tokenize 层先合并为独立 `"||"` token 再扩展。
     EmptyPipelineSegment,
+    /// `${...}` 内部 NAME 非法：空 `${}`、首字符非法（如 `${1abc}`、`${-X}`、`${ }`）、
+    /// 中间含非 NAME 字符（如 `${X-Y}`、`${X.Y}`、`${X Y}`）。与 bash `bad substitution`
+    /// 错误语义一致，最严格立即报错（不做字面量降级）。
+    BadSubstitution,
+    /// `${` 行尾仍未见闭合 `}`，如 `echo ${X` / `echo ${`。与
+    /// `UnterminatedSingleQuote` / `UnterminatedDoubleQuote` 风格一致：行内未闭合
+    /// 一律视为语法错误，由 REPL 决定如何提示。
+    UnterminatedBraceExpansion,
 }
 
 impl fmt::Display for ParseError {
@@ -116,6 +131,12 @@ impl fmt::Display for ParseError {
             }
             ParseError::EmptyPipelineSegment => {
                 write!(f, "syntax error: empty pipeline segment")
+            }
+            ParseError::BadSubstitution => {
+                write!(f, "syntax error: bad substitution")
+            }
+            ParseError::UnterminatedBraceExpansion => {
+                write!(f, "syntax error: unterminated brace expansion")
             }
         }
     }

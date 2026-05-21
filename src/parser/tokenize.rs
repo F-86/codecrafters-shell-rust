@@ -77,17 +77,49 @@ pub fn tokenize(
                     }
                 }
                 '$' => {
-                    // 引号外 `$NAME` 变量展开：peek 下一字符判定是否为合法 NAME 首字符。
-                    // - 合法：贪婪扫描 NAME（`is_name_cont`），用 NAME 查 vars——
-                    //   命中 push 值、未命中 push 空串；in_token 置真（即使展开为空串
-                    //   也开启 token，与 `""` 显式空 token 行为一致）。
-                    // - 非法（数字 / `-` / 空白 / 引号 / EOF 等）：把 `$` 当字面字符
-                    //   push，进入下一轮主循环按原规则处理后续字符（即 q4 决策的
-                    //   「`$` 字面降级」：`$1abc` 字面输出、`$-` 字面输出、行尾 `$` 字面）。
+                    // 引号外 `$NAME` / `${NAME}` 变量展开。
+                    //
+                    // 优先级：先 peek 下一字符——
+                    // - `{`：进入 `${NAME}` 大括号子分支（消费 `{`，扫描到 `}` 闭合）。
+                    //   错误形式：未闭合 → UnterminatedBraceExpansion；
+                    //   内部 NAME 非法（空 / 首字符非法 / 含非 NAME 字符）→ BadSubstitution。
+                    // - 合法 NAME 首字符：贪婪扫描 NAME（`is_name_cont`），用 NAME 查 vars。
+                    // - 其他（数字 / `-` / 空白 / 引号 / EOF 等）：把 `$` 当字面字符 push
+                    //   （q4 决策的「`$` 字面降级」：`$1abc` 字面输出、`$-` 字面输出、行尾 `$` 字面）。
+                    //
+                    // 命中 push 值、未命中 push 空串；in_token 置真（即使展开为空串
+                    // 也开启 token，与 `""` 显式空 token 行为一致）。
                     //
                     // `chars.clone().next()` 是 O(1) 安全 peek（std `Chars: Clone` 仅克隆
                     // 内部 &[u8] 指针）。
-                    if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
+                    if matches!(chars.clone().next(), Some('{')) {
+                        chars.next(); // 消费 `{`
+                        // 扫描到 `}` 闭合或 EOF；内部不允许嵌套展开（本 stage 无嵌套）
+                        let mut name = String::new();
+                        let mut closed = false;
+                        while let Some(c) = chars.next() {
+                            if c == '}' {
+                                closed = true;
+                                break;
+                            }
+                            name.push(c);
+                        }
+                        if !closed {
+                            return Err(ParseError::UnterminatedBraceExpansion);
+                        }
+                        // 整串 NAME 校验：拒绝空串 / 首字符非法 / 中间非法
+                        let mut name_chars = name.chars();
+                        let first_ok = matches!(name_chars.next(), Some(c) if is_name_start(c));
+                        let rest_ok = name_chars.all(is_name_cont);
+                        if !first_ok || !rest_ok {
+                            return Err(ParseError::BadSubstitution);
+                        }
+                        if let Some(value) = vars.get(&name) {
+                            current.push_str(value);
+                        }
+                        // 未命中：q2 决策展开为空串（current 不追加任何字符）
+                        in_token = true;
+                    } else if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
                         let mut name = String::new();
                         // 贪婪消费 NAME 字符：首字符已通过 peek 校验为 is_name_start，
                         // 直接 chars.next() 一次性收入；后续字符循环 peek + next。
@@ -256,13 +288,38 @@ pub fn tokenize(
                     }
                 }
                 '$' => {
-                    // 双引号内 `$NAME` 展开：与 Normal 态分支语义完全一致，
+                    // 双引号内 `$NAME` / `${NAME}` 展开：与 Normal 态分支语义完全一致，
                     // 仅状态机所属分支不同。重复实现而非抽函数：
                     // - 共享 `chars` / `current` / `in_token` 多个可变借用，抽函数
                     //   会引入 5 参签名，可读性反而下降；
                     // - 两态分支的展开行为契约对称，两份小代码块比一份带状态参数
                     //   的函数更易跟踪与维护。
-                    if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
+                    if matches!(chars.clone().next(), Some('{')) {
+                        chars.next(); // 消费 `{`
+                        let mut name = String::new();
+                        let mut closed = false;
+                        while let Some(c) = chars.next() {
+                            if c == '}' {
+                                closed = true;
+                                break;
+                            }
+                            name.push(c);
+                        }
+                        if !closed {
+                            return Err(ParseError::UnterminatedBraceExpansion);
+                        }
+                        let mut name_chars = name.chars();
+                        let first_ok = matches!(name_chars.next(), Some(c) if is_name_start(c));
+                        let rest_ok = name_chars.all(is_name_cont);
+                        if !first_ok || !rest_ok {
+                            return Err(ParseError::BadSubstitution);
+                        }
+                        if let Some(value) = vars.get(&name) {
+                            current.push_str(value);
+                        }
+                        // 未命中：展开为空串（双引号内 token 已经 in_token=true，
+                        // 这里无需再设置 in_token——双引号开启时已置真）。
+                    } else if matches!(chars.clone().next(), Some(c) if is_name_start(c)) {
                         let mut name = String::new();
                         while let Some(c) = chars.clone().next() {
                             if is_name_cont(c) {

@@ -1232,3 +1232,170 @@ fn dollar_expansion_double_quoted_escaped_dollar_is_literal() {
         vec!["echo", "$X"]
     );
 }
+
+// ========================================================================
+// ${VAR} 大括号参数展开测试组
+//
+// 语义契约（与 plan 决策对齐）：
+// - 引号外与双引号内：`${NAME}` 大括号边界明确，闭合后做整串 NAME 校验
+//   （字符集与 `$NAME` 同源，复用 is_name_start/is_name_cont）。
+// - 单引号内：`${X}` 整段字面，与单引号一切其他语义一致。
+// - 未命中：展开为空串（与 `$NAME` 同语义）。
+// - 反斜杠：`\${X}` 在 Normal 与双引号态走反斜杠路径——`$` 被先消费为字面 push，
+//   下一轮主循环看到 `{` 字面字符，自然得到 `${X}` 字面输出（零额外代码）。
+// - 错误：未闭合 `}` → UnterminatedBraceExpansion；
+//         内部 NAME 非法（空 / 首字符非法 / 含非 NAME 字符）→ BadSubstitution。
+// ========================================================================
+
+#[test]
+fn brace_expansion_problem_statement_verbatim() {
+    // 题面 verbatim：`stock_${Item}_id ${Foo1}` → 严格切出 3 个 argv（含 echo）
+    let vars = vars_with(&[("Item", "widget"), ("Foo1", "Bar2")]);
+    assert_eq!(
+        tokenize("./custom_exe_1234 stock_${Item}_id ${Foo1}", &vars).unwrap(),
+        vec!["./custom_exe_1234", "stock_widget_id", "Bar2"]
+    );
+}
+
+#[test]
+fn brace_expansion_unquoted_with_literal_suffix() {
+    // 题面示例：`${Var1}end` → `fooend`（消除 `$Var1end` 被读作 `Var1end` 的歧义）
+    let vars = vars_with(&[("Var1", "foo")]);
+    assert_eq!(
+        tokenize("echo ${Var1}end", &vars).unwrap(),
+        vec!["echo", "fooend"]
+    );
+}
+
+#[test]
+fn brace_expansion_unquoted_adjacent_pair() {
+    // 题面示例：`${Var1}and${Var2}` → `fooandbar`（紧邻边界明确）
+    let vars = vars_with(&[("Var1", "foo"), ("Var2", "bar")]);
+    assert_eq!(
+        tokenize("echo ${Var1}and${Var2}", &vars).unwrap(),
+        vec!["echo", "fooandbar"]
+    );
+}
+
+#[test]
+fn brace_expansion_unquoted_miss_is_empty() {
+    // 未定义变量在大括号形式下也展开为空串
+    assert_eq!(
+        tokenize("echo ${UNSET}end", &empty_vars()).unwrap(),
+        vec!["echo", "end"]
+    );
+}
+
+#[test]
+fn brace_expansion_double_quoted_concat() {
+    // 双引号内 `${X}` 与字面拼接为同一 token
+    let vars = vars_with(&[("X", "VAL")]);
+    assert_eq!(
+        tokenize(r#"echo "x${X}z""#, &vars).unwrap(),
+        vec!["echo", "xVALz"]
+    );
+}
+
+#[test]
+fn brace_expansion_double_quoted_miss_keeps_token() {
+    // 双引号内未命中 → 空串拼接，token 仍存在（即便整串为空）
+    assert_eq!(
+        tokenize(r#"echo "${UNSET}""#, &empty_vars()).unwrap(),
+        vec!["echo", ""]
+    );
+}
+
+#[test]
+fn brace_expansion_single_quoted_is_literal() {
+    // 单引号内 `${X}` 整段字面（即便 X 已定义）
+    let vars = vars_with(&[("X", "hello")]);
+    assert_eq!(
+        tokenize("echo '${X}'", &vars).unwrap(),
+        vec!["echo", "${X}"]
+    );
+}
+
+#[test]
+fn brace_expansion_escaped_unquoted_is_literal() {
+    // Normal 态 `\${X}` → 反斜杠分支吃 `$` 为字面，残余 `{X}` 按字面字符流入
+    let vars = vars_with(&[("X", "hello")]);
+    assert_eq!(
+        tokenize(r"echo \${X}", &vars).unwrap(),
+        vec!["echo", "${X}"]
+    );
+}
+
+#[test]
+fn brace_expansion_escaped_double_quoted_is_literal() {
+    // 双引号内 `\${X}` → 反斜杠白名单含 `$`，吃 `$` 为字面 push，残余 `{X}` 字面
+    let vars = vars_with(&[("X", "hello")]);
+    assert_eq!(
+        tokenize(r#"echo "\${X}""#, &vars).unwrap(),
+        vec!["echo", "${X}"]
+    );
+}
+
+#[test]
+fn brace_expansion_underscore_and_digits_in_name() {
+    // NAME 字符集与 `$NAME` 同源：`_x_1` 合法（首字符 `_` + 后续含数字/下划线）
+    let vars = vars_with(&[("_x_1", "ok")]);
+    assert_eq!(
+        tokenize("echo ${_x_1}", &vars).unwrap(),
+        vec!["echo", "ok"]
+    );
+}
+
+#[test]
+fn brace_expansion_unterminated_is_error() {
+    // 行尾未见闭合 `}` → UnterminatedBraceExpansion
+    assert_eq!(
+        tokenize("echo ${X", &empty_vars()),
+        Err(ParseError::UnterminatedBraceExpansion)
+    );
+}
+
+#[test]
+fn brace_expansion_unterminated_empty_is_error() {
+    // `echo ${` 同样属于未闭合
+    assert_eq!(
+        tokenize("echo ${", &empty_vars()),
+        Err(ParseError::UnterminatedBraceExpansion)
+    );
+}
+
+#[test]
+fn brace_expansion_empty_name_is_bad_substitution() {
+    // `${}` 空 NAME → BadSubstitution
+    assert_eq!(
+        tokenize("echo ${}", &empty_vars()),
+        Err(ParseError::BadSubstitution)
+    );
+}
+
+#[test]
+fn brace_expansion_invalid_first_char_digit_is_bad_substitution() {
+    // `${1abc}` 首字符非法 → BadSubstitution
+    assert_eq!(
+        tokenize("echo ${1abc}", &empty_vars()),
+        Err(ParseError::BadSubstitution)
+    );
+}
+
+#[test]
+fn brace_expansion_invalid_internal_char_is_bad_substitution() {
+    // `${X-Y}` 中间含非 NAME 字符 → BadSubstitution（拒绝静默截断）
+    assert_eq!(
+        tokenize("echo ${X-Y}", &empty_vars()),
+        Err(ParseError::BadSubstitution)
+    );
+}
+
+#[test]
+fn brace_expansion_double_quoted_unterminated_is_error() {
+    // 双引号内未闭合的 `${` 同样优先识别为 UnterminatedBraceExpansion
+    // （在大括号扫描阶段遇到 EOF 即报错，不会绕到双引号未闭合检查）
+    assert_eq!(
+        tokenize(r#"echo "${X"#, &empty_vars()),
+        Err(ParseError::UnterminatedBraceExpansion)
+    );
+}
