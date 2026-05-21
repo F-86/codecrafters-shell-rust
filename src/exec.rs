@@ -16,12 +16,39 @@
 //! 通知行 `[N] PID` 走父进程 stdout（直接 `println!`），**不复用** `sink`——
 //! 这与 bash 真实行为一致：job 控制信息属于 shell 自身的元信息，不应被用户的
 //! `>` / `1>` 重定向捕获到文件。
+//!
+//! ## Background Job stdio 继承（Stage: Background Job Output）
+//!
+//! codecrafters「Background Job Output」阶段要求后台进程的 stdout / stderr 仍连接
+//! 到 shell 终端，使 `cat /path/to/fifo &` 在 FIFO 收到写入后能直接把内容打到用户屏幕。
+//!
+//! 本模块当前实现**已满足该要求，无需任何代码改动**——关键事实链：
+//!
+//! 1. 后台分支与前台分支共用 L71-90 的 stdio 物化逻辑：未配置 `stdout_redirect` /
+//!    `stderr_redirect` 时一律使用 [`Stdio::inherit()`]，即「让子进程继承父 shell
+//!    当前的 stdout / stderr fd」。
+//! 2. [`Command::spawn`] 在 fork 后通过 `dup2(2)` 把父进程当前 stdout / stderr 复制
+//!    到子进程的同号 fd 上。**fd 在复制后即独立存活**，其可写性与父进程后续是否
+//!    `wait`、[`Child`] 句柄是否 `drop` **完全无关**——这是 POSIX fd 继承的标准
+//!    语义。
+//! 3. 由于 shell 启动时 stdout / stderr 直接挂在控制终端（tty）上，子进程通过 dup2
+//!    拿到的就是同一终端 fd 的副本；后台 `cat` 阻塞在 FIFO 读时，shell 已返回到下
+//!    一轮 readline；FIFO 一旦被写入，`cat` 唤醒后写自己的 fd1 / fd2 直达终端。
+//! 4. 与 rustyline raw mode 的边界：raw mode 改变的是 shell **自身读 stdin** 的回
+//!    显与行缓冲行为，**不影响** 其他进程**写**终端 fd 的可见性——子进程的 `write(2)`
+//!    系统调用对 tty 而言无视 raw / cooked 模式，输出立即可见（可能与 prompt 交错）。
+//!
+//! 因此 codecrafters tester（`cat /path/to/fifo1 &` 后接 `cat /path/to/fifo2`，再异步
+//! 向两个 FIFO 写入）所要求的「前后台输出均直达 shell 终端」直接由现有 `Stdio::inherit()`
+//! 满足。集成测试见 `tests/background_stdio.rs`。
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 
-use crate::builtins::find_in_path;
+use crate::builtins::{find_in_path, Job, JobStatus};
 use crate::parser::ParsedCommand;
 use crate::redirect::open_file_for_redirect;
 
@@ -37,6 +64,10 @@ use crate::redirect::open_file_for_redirect;
 /// - `next_job_id`：跨 REPL 循环存活的后台任务编号计数器。**仅在后台分支 spawn 成功后
 ///   `+= 1`**；前台分支与 spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job
 ///   编号的行为一致）。
+/// - `jobs_table`：跨 REPL 存活的后台作业表共享句柄（`Rc<RefCell<Vec<Job>>>`）。
+///   仅在后台分支 spawn 成功后 `borrow_mut().push(Job{...})`；前台分支与 spawn 失败
+///   时不触碰此表。push 使用**当前** `next_job_id`（递增之前），确保表内 `job.id`
+///   与通知行 `[N] PID` 中的 N 严格一致。
 ///
 /// 关键路径注释：
 /// - sink 走的是 `Box<dyn Write>` 抽象，运行时无法把它「拆回」具体类型，
@@ -58,6 +89,7 @@ pub fn run_external(
     sink: Box<dyn Write>,
     mut err_sink: Box<dyn Write>,
     next_job_id: &mut u32,
+    jobs_table: &Rc<RefCell<Vec<Job>>>,
 ) {
     let Some(path) = find_in_path(cmd) else {
         // 未在 PATH 命中：command not found 走 err_sink（可被 `2>` 捕获）
@@ -107,12 +139,27 @@ pub fn run_external(
         // - 通知走父进程 stdout（`println!`），不复用已 drop 的 sink——这与 bash
         //   一致：job 控制信息不被用户 `>` 重定向捕获到文件；
         // - spawn 失败按既有路径走 `command not found`，**不**递增 next_job_id。
+        //
+        // Stage「Background Job Output」语义锁定：进入此分支时 `stdio` / `err_stdio`
+        // 在无重定向情况下已是 `Stdio::inherit()`（见上方 L71-90），spawn 时通过 dup2
+        // 复制父进程的终端 fd 给子进程。fd 复制独立存活，与 `Child` 是否被 wait/drop
+        // 无关——后台 `cat /path/to/fifo` 阻塞读时 shell 已返回 prompt，FIFO 写入到
+        // 达后 cat 仍能直接写到继承来的终端 fd，输出对用户可见。详见模块头注释。
         match command.spawn() {
             Ok(child) => {
                 let pid = child.id();
                 // 通知行格式严格 `[<job>] <pid>\n`，方括号紧贴数字，单空格分隔。
                 // 失败（stdout 被关闭等罕见情形）静默吞掉，不阻断 REPL。
                 let _ = writeln!(std::io::stdout(), "[{}] {}", *next_job_id, pid);
+                // 入表：使用当前（递增前的）`next_job_id` 作为 Job.id，与通知行
+                // `[N] PID` 中的 N 严格一致。command 字符串用 `parsed.argv.join(" ")`
+                // 风格（无尾 `&`、无重定向片段，zsh 风格，tester 容忍）。
+                jobs_table.borrow_mut().push(Job {
+                    id: *next_job_id,
+                    pid,
+                    command: parsed.argv.join(" "),
+                    status: JobStatus::Running,
+                });
                 *next_job_id += 1;
                 // `child` 在此处 drop——Rust `Child::drop` 默认不 wait，符合
                 // 「fork+exec 不 waitpid」语义。

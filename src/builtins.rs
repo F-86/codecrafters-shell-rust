@@ -16,6 +16,51 @@ use std::path::PathBuf;
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
 pub const BUILTINS: &[&str] = &["echo", "exit", "type", "pwd", "cd", "complete", "jobs"];
 
+/// 后台作业状态。
+///
+/// 本阶段（codecrafters「list a single background job」）仅需要 `Running` 一个变体——
+/// 题面 Notes 明示「detecting when jobs exit will come in later stages」。
+/// `Done` / `Stopped` 等状态留待后续阶段加入；此 enum 故意保留扩展空间但**不**预先
+/// 实现 SIGCHLD reap 机制，避免过早设计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobStatus {
+    Running,
+}
+
+impl JobStatus {
+    /// 状态短串，用于 `jobs` 行内打印（左对齐到 24 字符宽）。
+    /// 显式 `&'static str` 映射，避免依赖 `Display` impl，便于后续阶段为不同状态
+    /// 加入额外字段时不破坏格式契约。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Running => "Running",
+        }
+    }
+}
+
+/// 单个后台作业的元信息。
+///
+/// 字段与题面「Tracking Background Jobs」四要素一一对应：
+/// - `id`：作业编号（`[N]` 中的 N），从 1 起递增；由 `next_job_id` 计数器分配；
+/// - `pid`：子进程 PID（`Command::spawn` 返回的 `Child::id()`，`u32`）；
+/// - `command`：命令字符串，本阶段用 `parsed.argv.join(" ")`（zsh 风格、无尾 `&`、
+///   无重定向片段）。题面明示「trailing `&` 是可选的」，tester 容忍；
+/// - `status`：当前状态，本阶段恒为 `Running`。
+///
+/// 不存 `started_at` / `exit_code` / `Child` 句柄等——本阶段无需 reap，留作未来扩展。
+///
+/// `pid` 在本阶段不参与 `jobs` 行内输出（题面格式未要求 PID 列），但保留字段以便
+/// 后续阶段 `jobs -l` flag 与 SIGCHLD reap 路径直接复用；`#[allow(dead_code)]`
+/// 显式抑制本阶段编译警告。
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: u32,
+    #[allow(dead_code)]
+    pub pid: u32,
+    pub command: String,
+    pub status: JobStatus,
+}
+
 /// 按 PATH 顺序查找可执行文件。
 /// 命中条件：文件存在、是普通文件、Unix 执行位（owner/group/other 任一）置位。
 /// 目录不存在 / 无权限读取 / 非普通文件等场景静默跳过，与 bash 实际行为一致。
@@ -212,27 +257,65 @@ pub fn run_complete(
     }
 }
 
-/// `jobs` 内建：列出当前 shell 已知的后台任务（job number / 状态 / 命令）。
+/// `jobs` 内建：列出当前 shell 已知的、仍在运行的后台作业。
 ///
-/// 本阶段为**空实现占位**——题面 Notes 明确：真实任务列表逻辑（伴随 `&` 后台执行、
-/// SIGCHLD 回收、状态机等）留待后续阶段。当前能力清单：
-/// - `BUILTINS` 已追加 `"jobs"`，故 `type jobs` 命中 `run_type` 的 builtin 分支，
-///   输出 `jobs is a shell builtin`（走 sink，可被 `1>` / `>` 重定向）；
-/// - 直接执行 `jobs` 不向 sink / err_sink 写任何字节，REPL 立刻回到提示符。
+/// codecrafters 阶段「list a single background job」要求按 bash 兼容格式输出：
 ///
-/// 签名风格刻意与 `run_type` / `run_complete` 对齐（接 sink / err_sink / args + 返回
-/// `io::Result<()>`），便于后续阶段就地扩展为真实列表打印逻辑时——
-/// dispatch 框架、错误信道、写错误传播路径**零改动**。
+/// ```text
+/// [1]+  Running                 sleep 10
+/// ```
 ///
-/// 参数前缀 `_` 仅为消除 unused 警告，并非语义弱化：后续阶段填充实现时直接去掉
-/// 下划线即可投入使用。
+/// ## 格式契约（精确）
+///
+/// 单条作业一行，格式 `"[{id}]{mark}  {status:<24}{cmd}\n"`：
+/// - `[<id>]`：方括号紧贴 job 编号，无空格
+/// - `<mark>`：`+` 表示**最近一个**后台作业，`-` 表示次新，更早的作业无标记。
+///   bash 真实行为下「最近作业」即作业表中最后一条；本阶段单作业场景下唯一一条
+///   恒为 `+`，但实现已按多作业规则前向兼容（`idx == len-1` → `+`，`idx == len-2`
+///   → `-`，其余 → 空格占位以保持列对齐）
+/// - **2 个空格**分隔 mark 与 status 字段
+/// - `status` 字段总宽 **24 字符**（`{:<24}` 左对齐填充）：`"Running"` 7 字符 +
+///   17 个空格 = 24
+/// - `cmd`：命令字符串，本阶段用 `parsed.argv.join(" ")` 风格（无尾 `&`、无重定向
+///   片段，zsh 风格，tester 容忍）
+///
+/// ## 信道与重定向语义
+///
+/// 输出全部走 `sink`（stdout），可被 `>` / `1>` / `>>` / `1>>` 重定向到文件。
+/// 本阶段无错误路径——遍历空表也只是 0 行输出，不向 `err_sink` 写任何字节。
+/// `args` 暂未使用（题面未规定 flag），保留参数位以与 `run_type` / `run_complete`
+/// 签名风格对齐，便于后续阶段加入 `jobs -l` 等 flag 时零调用点改动。
 pub fn run_jobs(
-    _sink: &mut dyn Write,
+    sink: &mut dyn Write,
     _err_sink: &mut dyn Write,
     _args: &[String],
+    jobs: &[Job],
 ) -> io::Result<()> {
-    // 本阶段无任务表数据源、无输出。后续阶段在此处遍历 job 表并按
-    // `[<n>] <status>  <cmd>` 格式逐行写入 sink。
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let last_idx = jobs.len() - 1;
+    for (idx, job) in jobs.iter().enumerate() {
+        // mark 计算：最近作业 `+`，次新 `-`，更早 ` ` 占位。
+        // 本阶段单作业场景下 idx == last_idx == 0，恒为 `+`。
+        let mark = if idx == last_idx {
+            '+'
+        } else if idx + 1 == last_idx {
+            '-'
+        } else {
+            ' '
+        };
+        // 一次性 writeln! 写整行——避免分多次 write 在 `>` 重定向下被其他写入
+        // 穿插造成字节顺序问题。`{:<24}` 左对齐填充到 24 字符总宽。
+        writeln!(
+            sink,
+            "[{}]{}  {:<24}{}",
+            job.id,
+            mark,
+            job.status.as_str(),
+            job.command
+        )?;
+    }
     Ok(())
 }
 
@@ -298,5 +381,97 @@ mod tests {
         let (out, err) = invoke(&["-p", "git"], &mut reg);
         assert_eq!(out, "complete -C '/new/path' git\n");
         assert!(err.is_empty(), "-p 命中不写 stderr");
+    }
+
+    // ---- Stage「list a single background job」：run_jobs 格式契约用例 ----
+
+    /// 跑 `run_jobs` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。
+    fn invoke_jobs(jobs: &[Job]) -> (String, String) {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        run_jobs(&mut sink, &mut err, &[], jobs).expect("run_jobs");
+        (
+            String::from_utf8(sink).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    #[test]
+    fn jobs_single_running_exact_format() {
+        // 题面 tester 唯一场景：单作业、Running、`+` 标记、24 宽 status 填充
+        let jobs = vec![Job {
+            id: 1,
+            pid: 84470,
+            command: "sleep 10".to_string(),
+            status: JobStatus::Running,
+        }];
+        let (out, err) = invoke_jobs(&jobs);
+        // 完整逐字节匹配：`[1]+` + 2 空格 + "Running" + 17 空格 + "sleep 10\n"
+        assert_eq!(out, "[1]+  Running                 sleep 10\n");
+        assert!(err.is_empty(), "jobs 不向 stderr 写字节");
+    }
+
+    #[test]
+    fn jobs_status_field_padded_to_24_chars() {
+        // 显式验证：mark 后的 2 空格分隔之后，status + 填充共 24 字符宽，紧接 cmd
+        let jobs = vec![Job {
+            id: 1,
+            pid: 1,
+            command: "x".to_string(),
+            status: JobStatus::Running,
+        }];
+        let (out, _) = invoke_jobs(&jobs);
+        // 行格式：`[1]+  ` (6 字节) + status_field (24 字节) + "x\n"
+        // 计算 status_field 起止：从 "  " 之后到 "x" 之前
+        let prefix = "[1]+  ";
+        let suffix = "x\n";
+        assert!(out.starts_with(prefix));
+        assert!(out.ends_with(suffix));
+        let status_field = &out[prefix.len()..out.len() - suffix.len()];
+        assert_eq!(status_field.len(), 24, "status 字段总宽必须为 24");
+        assert!(status_field.starts_with("Running"));
+        // 7 字符 "Running" + 17 空格 = 24
+        assert_eq!(&status_field[7..], &" ".repeat(17));
+    }
+
+    #[test]
+    fn jobs_empty_table_no_output() {
+        // 空作业表：sink / err_sink 均零字节，Ok(())
+        let (out, err) = invoke_jobs(&[]);
+        assert!(out.is_empty(), "空表不写 stdout");
+        assert!(err.is_empty(), "空表不写 stderr");
+    }
+
+    #[test]
+    fn jobs_multi_marker_plus_minus_space() {
+        // 多作业前向兼容验证：最近 `+`、次新 `-`、更早空格占位
+        // 本阶段 tester 不测，但 mark 计算逻辑需自洽避免未来阶段返工
+        let jobs = vec![
+            Job {
+                id: 1,
+                pid: 100,
+                command: "a".to_string(),
+                status: JobStatus::Running,
+            },
+            Job {
+                id: 2,
+                pid: 200,
+                command: "b".to_string(),
+                status: JobStatus::Running,
+            },
+            Job {
+                id: 3,
+                pid: 300,
+                command: "c".to_string(),
+                status: JobStatus::Running,
+            },
+        ];
+        let (out, _) = invoke_jobs(&jobs);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // idx=0 → 空格（最早），idx=1 → `-`（次新），idx=2 → `+`（最近）
+        assert!(lines[0].starts_with("[1]   "), "最早作业空格占位: {:?}", lines[0]);
+        assert!(lines[1].starts_with("[2]-  "), "次新作业 `-`: {:?}", lines[1]);
+        assert!(lines[2].starts_with("[3]+  "), "最近作业 `+`: {:?}", lines[2]);
     }
 }

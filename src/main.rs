@@ -9,7 +9,7 @@ mod exec;
 mod parser;
 mod redirect;
 
-use builtins::{run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type};
+use builtins::{run_cd, run_complete, run_echo, run_jobs, run_pwd, run_type, Job};
 use completion::ShellHelper;
 use exec::run_external;
 use redirect::{open_err_sink, open_sink};
@@ -51,6 +51,14 @@ fn main() {
     // spawn 失败时保持不变（与 bash 仅在成功后台启动后分配 job 编号一致）。
     // 本阶段单线程串行 REPL 无需 `Rc<RefCell<...>>`，`&mut u32` 直接传参即可。
     let mut next_job_id: u32 = 1;
+
+    // 后台作业表：跨 REPL 循环存活，记录已 spawn 但尚未回收的 Job。
+    // 用 `Rc<RefCell<Vec<Job>>>` 复刻 `completions` 注册表风格：
+    // - 写端 `run_external`（后台 spawn 成功后 push）；
+    // - 读端 `run_jobs`（遍历列出）；
+    // - 为未来 SIGCHLD 异步回收（reaper 线程或 signalfd）预留共享路径。
+    // 单线程 REPL 串行节奏天然不并发借用。
+    let jobs_table: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
 
     loop {
         // 2. 读取一行输入（rustyline 内部处理提示符绘制、回显、TAB 补全、行编辑）。
@@ -158,15 +166,15 @@ fn main() {
                 }
             }
             "jobs" => {
-                // 本阶段空实现：无输出、立刻返回提示符。
-                // 仍走完整 sink / err_sink dispatch 通道，便于后续阶段填充
-                // 任务列表逻辑时无需改动 main.rs。
-                if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args) {
+                // 本阶段：列出唯一的运行中后台作业。借出 `&[Job]` 切片传给 run_jobs；
+                // borrow 作用域到本 match arm 结束即释放，不与 dispatch 后续路径冲突。
+                let view = jobs_table.borrow();
+                if let Err(e) = run_jobs(&mut *sink, &mut *err_sink, args, &view) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
             _ => {
-                run_external(cmd, line, args, &parsed, sink, err_sink, &mut next_job_id);
+                run_external(cmd, line, args, &parsed, sink, err_sink, &mut next_job_id, &jobs_table);
             }
         }
     }
