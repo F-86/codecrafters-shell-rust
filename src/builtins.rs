@@ -572,56 +572,124 @@ pub fn run_history(
     Ok(())
 }
 
-/// `declare` 内建：本阶段仅实现 `-p NAME` 的「变量不存在」分支。
+/// 对 VALUE 中的 4 个 bash「双引号上下文敏感字符」前加反斜杠，便于
+/// `declare -p` 输出可被 shell 直接 re-eval 还原同一变量。
 ///
-/// ## 题面契约（codecrafters「declare -p flag (not-found branch)」）
+/// ## 转义规则（对齐 bash `declare -p` 真实行为）
 ///
-/// `declare -p NAME` 在 NAME 未被定义时向 stderr 打印
-/// `declare: <NAME>: not found`（writeln 自带末尾换行）。
+/// 仅对以下 4 个字符前加 `\`：
+/// - `\`：反斜杠本身需先转义自己
+/// - `"`：双引号必须转义，否则破坏 `declare -- NAME="..."` 包裹的字符串边界
+/// - `$`：避免 re-eval 触发参数 / 命令展开
+/// - `` ` ``：避免 re-eval 触发命令替换
 ///
-/// ## 本阶段实现策略：硬编码视作「全部不存在」
+/// 其它字符（空格、单引号、感叹号、`\n` 等）原样输出——bash 在双引号
+/// 上下文中对它们也不做转义。
 ///
-/// 题面 Notes 明确「You can hardcode the output of the declare builtin for
-/// this stage. We'll get to implementing storing shell variables in the later
-/// stages.」——本阶段尚无变量存储后端，故所有 `-p NAME` 调用统一视作
-/// NAME 不存在；后续阶段把 not-found 分支改为「先查存储、未命中再报错」即可，
-/// 调用点签名不动。
+/// ## 不需要校验 / 兜底
 ///
-/// ## 行为表
+/// 输入 `&str` 已是合法 UTF-8，函数为纯字符级扫描；空串 → 空 String，
+/// 全特殊字符 → 长度翻倍，无 panic / 错误路径，调用点不必处理 Result。
+fn escape_for_double_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `declare` 内建：shell 变量存储 + `-p NAME` 描述打印。
 ///
-/// - `declare -p NAME`（任何 NAME）：stderr `declare: NAME: not found`
-/// - `declare -p`（缺 NAME）/ `declare`（无参）/ `declare var=value` /
-///   其它形式：静默 `Ok(())`，绝不向 sink/err_sink 写任何字节。
+/// ## 题面契约（codecrafters「Storing and displaying shell variables」）
 ///
-/// 「非 -p NAME 路径全部静默 Ok」是第一阶段占位 arm 注释强调的契约延续——
-/// 不能让 declare 调用走 `run_external` 报 `command not found`，违反
-/// `type declare` 声称是 builtin 的一致性。
+/// - `declare NAME=VALUE`：把变量写入 shell 内部存储；同名重复 declare 覆盖旧值
+/// - `declare -p NAME` 命中：stdout 输出 `declare -- NAME="<escaped VALUE>"\n`
+/// - `declare -p NAME` 未命中：stderr 输出 `declare: NAME: not found\n`
 ///
-/// ## 不强制 NAME 合法标识符校验
+/// ## 行为表（5 路分派）
 ///
-/// `<NAME>` 直接来自 `args[1]` 原文回显，不做 bash valid identifier 校验。
-/// 题面只规定 `not found` 一种错误形式，未提及 `not a valid identifier` 分支；
-/// tester 用例 `missing_variable` 本身合法，无歧义。
+/// 1. `declare NAME=VALUE`（`args[0]` 不以 `-` 开头且含 `=`）：
+///    `vars.insert(NAME, VALUE)`，静默 Ok。VALUE 来自 `splitn(2, '=')` 第二段，
+///    正确处理 `declare foo=a=b`（VALUE = `a=b`）。
+/// 2. `declare NAME`（`args[0]` 不以 `-` 开头且不含 `=`）：等价 `NAME=""`，
+///    `vars.insert(NAME, String::new())`，静默 Ok。对齐 bash 「declare 单参声明
+///    空变量」语义，分派路径统一收敛到 `vars.insert`。
+/// 3. `declare -p NAME ...`（`args[0] == "-p"` 且 `args.len() >= 2`）：
+///    查 `vars.get(NAME)`：
+///    - Some(v) → stdout `declare -- NAME="{escape(v)}"\n`
+///    - None    → stderr `declare: NAME: not found\n`
+/// 4. 其它形态（空 args / `declare -p` 缺 NAME / `declare -x` 等）：
+///    静默 `Ok(())`，绝不向 sink/err_sink 写任何字节，避免污染 tester。
 ///
-/// ## sink 参数保留原因
+/// ## 关键设计决策
 ///
-/// 本阶段函数体不写 stdout，`sink` 参数仅作为后续阶段「-p 命中分支」
-/// （需要写 `declare -- name="value"` 到 stdout）的预留挂载点，避免
-/// 后续阶段动调用点签名。dyn Write 引用作为入参不会触发 unused 警告。
+/// - **VALUE 解析仅 splitn(2, '=')**：args 已被 parser 完成空白拆分 + 引号脱壳，
+///   `run_declare` 视角下每个 arg 是独立 token；首个 `=` 为分隔符，其后任意
+///   `=` 都属于 VALUE 内容。
+/// - **NAME 不做合法标识符校验**：题面 tester 用例（`foo` / `missing_variable`）
+///   都合法；bash 真实的 valid-identifier 错误分支本阶段不实现，超纲。
+/// - **`-p` 多 NAME 仅查首个**：`args[1]` 是首个 NAME；本阶段未实现
+///   `declare -p A B` 多 NAME 批量查询，超出 tester 范围。
+/// - **「非主路径全静默 Ok」契约延续**：第一阶段占位 arm 注释强调的「declare
+///   调用绝不报 `command not found`」契约保留——dispatch arm 必须留在
+///   `_ => run_external` 之前。
+///
+/// ## sink / err_sink 参数
+///
+/// 本阶段两路都可能写：`-p` 命中走 stdout、未命中走 stderr。两个 dyn Write
+/// 入参的所有路径都已被消费，无 unused 警告。
 pub fn run_declare(
     sink: &mut dyn Write,
     err_sink: &mut dyn Write,
     args: &[String],
+    vars: &mut HashMap<String, String>,
 ) -> io::Result<()> {
-    // 占位消费 sink 以明确表达「本阶段刻意不写 stdout」的意图，
-    // 同时保留参数为后续 -p 命中分支预留挂载点。
-    let _ = sink;
+    // 空 args（裸 `declare`）：静默 Ok，与「非主路径全静默」契约对齐。
+    let first = match args.first() {
+        Some(s) => s.as_str(),
+        None => return Ok(()),
+    };
 
-    // 仅 `-p NAME ...` 主路径写错误；其它形态一律静默 Ok。
-    if args.len() >= 2 && args[0] == "-p" {
-        let name = &args[1];
-        writeln!(err_sink, "declare: {}: not found", name)?;
+    // 路径 3：`-p NAME ...` 查询打印
+    if first == "-p" {
+        if args.len() >= 2 {
+            let name = &args[1];
+            match vars.get(name) {
+                Some(value) => {
+                    let escaped = escape_for_double_quote(value);
+                    writeln!(sink, "declare -- {}=\"{}\"", name, escaped)?;
+                }
+                None => {
+                    writeln!(err_sink, "declare: {}: not found", name)?;
+                }
+            }
+        }
+        // `declare -p` 缺 NAME：静默 Ok（本阶段不实现「列举所有变量」）
+        return Ok(());
     }
+
+    // 路径 4：未知 flag（`-x` / `-r` / `--` 等）：静默 Ok，超出本阶段范围。
+    if first.starts_with('-') {
+        return Ok(());
+    }
+
+    // 路径 1 / 2：写入 store
+    // - `splitn(2, '=')` 仅切首个 `=`：
+    //   - 含 `=` → (NAME, VALUE)，`next()` 两次都拿到 Some
+    //   - 不含 `=` → (NAME, _) 第二次 `next()` 是 None → 走空值分支
+    let mut iter = first.splitn(2, '=');
+    let name = iter.next().unwrap_or(""); // 守卫：splitn 始终至少返回一段
+    let value = iter.next().unwrap_or(""); // 不含 `=` → 空串声明（q3 决策）
+    if !name.is_empty() {
+        vars.insert(name.to_string(), value.to_string());
+    }
+    // NAME 为空（如 `declare =foo`）：静默 Ok，避免污染 store 与输出。
     Ok(())
 }
 
@@ -1130,14 +1198,18 @@ mod tests {
         assert!(err.is_empty());
     }
 
-    // ---- Stage「declare -p flag (not-found branch)」：run_declare 用例 ----
+    // ---- Stage「Storing and displaying shell variables」：run_declare 用例 ----
 
     /// 跑 `run_declare` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。
-    fn invoke_declare(args: &[&str]) -> (String, String) {
+    /// 第二参传入 `&mut HashMap` 以串联多次调用、验证 store 状态机。
+    fn invoke_declare(
+        args: &[&str],
+        vars: &mut HashMap<String, String>,
+    ) -> (String, String) {
         let mut sink: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        run_declare(&mut sink, &mut err, &owned).expect("run_declare");
+        run_declare(&mut sink, &mut err, &owned, vars).expect("run_declare");
         (
             String::from_utf8(sink).expect("utf8 stdout"),
             String::from_utf8(err).expect("utf8 stderr"),
@@ -1146,41 +1218,144 @@ mod tests {
 
     #[test]
     fn declare_p_missing_variable_writes_stderr() {
-        // 题面核心断言：`declare -p missing_variable` →
-        // stderr `declare: missing_variable: not found\n`，stdout 空。
-        let (out, err) = invoke_declare(&["-p", "missing_variable"]);
-        assert!(out.is_empty(), "-p NAME 不写 stdout");
+        // 题面核心断言：`declare -p missing_variable` 在变量未定义时
+        // → stderr `declare: missing_variable: not found\n`，stdout 空。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["-p", "missing_variable"], &mut vars);
+        assert!(out.is_empty(), "-p 未命中不写 stdout");
         assert_eq!(err, "declare: missing_variable: not found\n");
     }
 
     #[test]
-    fn declare_p_any_name_treated_as_missing() {
-        // 验证「硬编码视作所有 NAME 不存在」契约：换多个 NAME 均走 not-found 分支，
-        // 且错误信息中的 NAME 直接来自 args 原文回显（不做合法标识符校验）。
+    fn declare_p_any_unset_name_is_not_found() {
+        // 空 store 下任意 NAME 都走 not-found 分支，且错误信息 NAME
+        // 直接来自 args 原文回显（不做合法标识符校验）。
+        let mut vars: HashMap<String, String> = HashMap::new();
         for name in &["FOO", "x", "Some_Var123", "weird-name", "0bad"] {
-            let (out, err) = invoke_declare(&["-p", name]);
-            assert!(out.is_empty(), "-p {} 不写 stdout", name);
+            let (out, err) = invoke_declare(&["-p", name], &mut vars);
+            assert!(out.is_empty(), "-p {} 未命中不写 stdout", name);
             assert_eq!(err, format!("declare: {}: not found\n", name));
         }
     }
 
     #[test]
     fn declare_silent_paths_no_output() {
-        // 验证非 `-p NAME` 路径全部静默 Ok：不写 stdout/stderr，避免污染或回归。
-        // 对应第一阶段占位 arm 注释强调的「declare 调用绝不报 command not found」契约。
+        // 验证非主路径全部静默 Ok：不写 stdout/stderr，避免污染或回归。
+        // 对应第一阶段占位 arm 注释强调的「declare 调用绝不报 command not
+        // found」契约（本阶段从「foo=bar 静默」推翻为「foo=bar 写入 store」，
+        // 该断言已迁移到 declare_assign_then_print_roundtrip 用例）。
+        let mut vars: HashMap<String, String> = HashMap::new();
         for args in &[
             // 空 args（直接输入 `declare`）
             &[][..],
             // `-p` 缺 NAME
             &["-p"][..],
-            // 形如 `declare foo=bar`：本阶段不实现存储，静默
-            &["foo=bar"][..],
             // 未知 flag：本阶段不报错，静默
             &["-x"][..],
+            &["-r"][..],
         ] {
-            let (out, err) = invoke_declare(args);
+            let (out, err) = invoke_declare(args, &mut vars);
             assert!(out.is_empty(), "args {:?} 不应写 stdout，实际 {:?}", args, out);
             assert!(err.is_empty(), "args {:?} 不应写 stderr，实际 {:?}", args, err);
         }
+        assert!(vars.is_empty(), "静默路径不应写入 store");
+    }
+
+    #[test]
+    fn declare_assign_then_print_roundtrip() {
+        // 题面核心契约：写入后用 -p 回读，stdout 严格匹配
+        // `declare -- foo="bar"\n`，stderr 空，store 中确有该键。
+        let mut vars: HashMap<String, String> = HashMap::new();
+
+        let (out, err) = invoke_declare(&["foo=bar"], &mut vars);
+        assert!(out.is_empty(), "写入路径不写 stdout");
+        assert!(err.is_empty(), "写入路径不写 stderr");
+        assert_eq!(vars.get("foo").map(String::as_str), Some("bar"));
+
+        let (out, err) = invoke_declare(&["-p", "foo"], &mut vars);
+        assert_eq!(out, "declare -- foo=\"bar\"\n");
+        assert!(err.is_empty(), "-p 命中不写 stderr");
+    }
+
+    #[test]
+    fn declare_reassign_overwrites_value() {
+        // 题面 tester 用例：`declare foo=bar` → `declare foo=bar2` →
+        // `declare -p foo` 应反映最新值 bar2。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        invoke_declare(&["foo=bar"], &mut vars);
+        invoke_declare(&["foo=bar2"], &mut vars);
+        let (out, err) = invoke_declare(&["-p", "foo"], &mut vars);
+        assert_eq!(out, "declare -- foo=\"bar2\"\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn declare_bare_name_declares_empty_value() {
+        // q3 决策：`declare foo` 等价 `declare foo=""`，写入空串。
+        // -p 回读应得 `declare -- foo=""\n`。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        invoke_declare(&["foo"], &mut vars);
+        assert_eq!(vars.get("foo").map(String::as_str), Some(""));
+        let (out, err) = invoke_declare(&["-p", "foo"], &mut vars);
+        assert_eq!(out, "declare -- foo=\"\"\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn declare_p_escapes_special_chars() {
+        // q2 决策：对 `\` `"` `$` `` ` `` 4 字符在双引号内加反斜杠，
+        // 其它字符（空格 / 单引号 / `!` / 中文等）原样输出。
+        // 每个 case：(VALUE 原文, 期望 stdout 中双引号内的转义形式)
+        let cases: &[(&str, &str)] = &[
+            ("a\\b", "a\\\\b"), // \  → \\
+            ("a\"b", "a\\\"b"), // "  → \"
+            ("a$b", "a\\$b"),   // $  → \$
+            ("a`b", "a\\`b"),   // `  → \`
+            // 复合：4 种特殊字符同时出现
+            ("\\\"$`", "\\\\\\\"\\$\\`"),
+            // 不转义的字符：空格 / 单引号 / ! / 中文
+            ("a b 'c' !d", "a b 'c' !d"),
+            ("中文 ok", "中文 ok"),
+        ];
+        for (i, (value, escaped)) in cases.iter().enumerate() {
+            let mut vars: HashMap<String, String> = HashMap::new();
+            let name = format!("v{}", i);
+            let assign = format!("{}={}", name, value);
+            invoke_declare(&[assign.as_str()], &mut vars);
+            let (out, err) = invoke_declare(&["-p", &name], &mut vars);
+            assert_eq!(
+                out,
+                format!("declare -- {}=\"{}\"\n", name, escaped),
+                "VALUE={:?} 期望转义 {:?}",
+                value,
+                escaped
+            );
+            assert!(err.is_empty(), "case {}: -p 命中不写 stderr", i);
+        }
+    }
+
+    #[test]
+    fn declare_value_with_equals_sign_preserved() {
+        // splitn(2, '=') 仅切首个 `=`：`declare foo=a=b` 应 store foo → "a=b"，
+        // -p 回读应得 `declare -- foo="a=b"\n`。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        invoke_declare(&["foo=a=b"], &mut vars);
+        assert_eq!(vars.get("foo").map(String::as_str), Some("a=b"));
+        let (out, err) = invoke_declare(&["-p", "foo"], &mut vars);
+        assert_eq!(out, "declare -- foo=\"a=b\"\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn declare_p_after_set_then_unset_path_still_hit() {
+        // 集成 not-found 与命中分支：未定义 → not-found；定义后 → 命中。
+        // 防止「定义后路径误走 not-found」回归。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (_, err) = invoke_declare(&["-p", "x"], &mut vars);
+        assert_eq!(err, "declare: x: not found\n");
+        invoke_declare(&["x=1"], &mut vars);
+        let (out, err) = invoke_declare(&["-p", "x"], &mut vars);
+        assert_eq!(out, "declare -- x=\"1\"\n");
+        assert!(err.is_empty());
     }
 }

@@ -97,6 +97,22 @@ fn main() {
     // 看到清理后的表。
     let jobs_table: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
 
+    // Stage「Storing and displaying shell variables」：shell 变量存储后端
+    // （NAME → VALUE）。跨 REPL 循环存活，承载 `declare NAME=VALUE` 写入与
+    // `declare -p NAME` 命中查询。
+    //
+    // 用 `Rc<RefCell<...>>` 而非裸 `HashMap`，与 `completions` / `jobs_table`
+    // 保持注册表风格 100% 对齐：
+    // - 写端：dispatch `"declare"` arm 调 `run_declare(... &mut vars.borrow_mut())`，
+    //   沿用 `run_complete` 同形签名（第 4 参 `&mut HashMap`），借用作用域到
+    //   match arm 结束即释放；
+    // - 读端：本阶段只在 `run_declare` 内部读取（`-p NAME` 查询），尚无外部
+    //   读端。`Rc<RefCell<>>` 框架为后续阶段「`$VAR` 展开」预留共享路径——
+    //   届时 parser / `ShellHelper` 可拿 `Rc::clone()` 持有读端引用，无需改动
+    //   `run_declare` 签名或调用点；
+    // - 单线程 REPL 串行节奏天然不并发借用，无 RuntimeError 风险。
+    let shell_vars: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
+
     // Stage「history -a <path>」会话级游标：记录上次 `-a` 成功打开文件时
     // `editor.history().len()` 的值。下次 `-a` 仅追加 `history[last_appended_len..]`
     // 切片，实现 bash 增量追加语义（Notes 第 2 条：only append since last -a）。
@@ -492,20 +508,31 @@ fn main() {
                     eprintln!("shell: write error: {}", e);
                 }
             }
-            // Stage「declare -p flag (not-found branch)」：实现 `declare -p NAME`
-            // 在 NAME 未定义时向 stderr 打印 `declare: NAME: not found`。
-            // 题面 Notes 明确「hardcode the output for this stage」——本阶段尚无
-            // 变量存储后端，`run_declare` 内部把所有 `-p NAME` 调用统一视作
-            // NAME 不存在；其它形态（`declare` 无参 / `declare -p` 缺 NAME /
-            // `declare foo=bar` 等）静默 Ok，待后续阶段实现。
+            // Stage「Storing and displaying shell variables」：完整实现 declare
+            // 的存储 / 打印闭环，由 `shell_vars` 提供变量后端。
             //
-            // 此 arm 必须位于 `_ => run_external` 之前，否则用户在 REPL 直接输入
-            // `declare foo=bar` 会落入兜底走 PATH 查找并打印 `declare: command not found`，
-            // 违反「`type` 声称是 builtin、执行也应按 builtin 处理」的契约一致性。
+            // 五路分派（详见 `run_declare` 文档）：
+            // - `declare NAME=VALUE`     → 写入 store，静默 Ok
+            // - `declare NAME`           → 等价 NAME=""，写入 store，静默 Ok
+            // - `declare -p NAME` 命中    → stdout `declare -- NAME="<escaped>"\n`
+            // - `declare -p NAME` 未命中  → stderr `declare: NAME: not found\n`
+            // - 其它（`declare` / `declare -p` / `declare -x` 等） → 静默 Ok
             //
-            // IO 错误包裹模板与上方 `run_history` 调用一字不差对齐。
+            // 此 arm 必须位于 `_ => run_external` 之前，否则用户在 REPL 直接
+            // 输入 `declare foo=bar` 会落入兜底走 PATH 查找并打印
+            // `declare: command not found`，违反「`type` 声称是 builtin、执行
+            // 也应按 builtin 处理」的契约一致性。
+            //
+            // `&mut shell_vars.borrow_mut()` 模板与上方 `complete` arm 的
+            // `&mut completions.borrow_mut()` 一字不差对齐；IO 错误包裹模板
+            // 复用 `run_history` / `run_complete` 调用点。
             "declare" => {
-                if let Err(e) = run_declare(&mut *sink, &mut *err_sink, args) {
+                if let Err(e) = run_declare(
+                    &mut *sink,
+                    &mut *err_sink,
+                    args,
+                    &mut shell_vars.borrow_mut(),
+                ) {
                     eprintln!("shell: write error: {}", e);
                 }
             }
