@@ -604,6 +604,37 @@ fn escape_for_double_quote(s: &str) -> String {
     out
 }
 
+/// 校验 `name` 是否是合法的 shell 变量标识符（bash POSIX 规则）。
+///
+/// ## 规则（对齐 bash valid-identifier）
+///
+/// 等价正则 `^[A-Za-z_][A-Za-z0-9_]*$`，**ASCII-only**：
+///
+/// - 首字符必须是 ASCII 字母（`A-Z` / `a-z`）或下划线（`_`）
+/// - 后续字符必须是 ASCII 字母 / 数字（`0-9`）/ 下划线
+/// - 空串视为非法（首字符不存在 → 不满足首字符规则）
+///
+/// ## 设计决策
+///
+/// - **不引入 `regex` crate**：bash 的 valid-identifier 是固定的小型
+///   状态机，手写 byte-level 扫描（`as_bytes()`）零分配、零编译开销
+/// - **ASCII-only 而非 Unicode 字母**：bash 默认 LANG=C 下不放行
+///   多字节 Unicode 字母，本实现刻意保持 byte 视图，与 bash 行为对齐；
+///   多字节字符首字节高位为 1，会被 `is_ascii_alphabetic` 直接拒绝
+/// - **零拷贝**：仅借用 `&str`，遍历过程不分配
+fn is_valid_identifier(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false; // 空串：首字符不存在 → 非法
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// `declare` 内建：shell 变量存储 + `-p NAME` 描述打印。
 ///
 /// ## 题面契约（codecrafters「Storing and displaying shell variables」）
@@ -615,25 +646,41 @@ fn escape_for_double_quote(s: &str) -> String {
 /// ## 行为表（5 路分派）
 ///
 /// 1. `declare NAME=VALUE`（`args[0]` 不以 `-` 开头且含 `=`）：
-///    `vars.insert(NAME, VALUE)`，静默 Ok。VALUE 来自 `splitn(2, '=')` 第二段，
-///    正确处理 `declare foo=a=b`（VALUE = `a=b`）。
+///    校验 NAME 合法性（见下「NAME 合法性校验」），合法则
+///    `vars.insert(NAME, VALUE)`，静默 Ok；非法则 stderr 报错，不写 store。
+///    VALUE 来自 `splitn(2, '=')` 第二段，正确处理 `declare foo=a=b`
+///    （VALUE = `a=b`）。
 /// 2. `declare NAME`（`args[0]` 不以 `-` 开头且不含 `=`）：等价 `NAME=""`，
-///    `vars.insert(NAME, String::new())`，静默 Ok。对齐 bash 「declare 单参声明
-///    空变量」语义，分派路径统一收敛到 `vars.insert`。
+///    同样先校验 NAME，合法则 `vars.insert(NAME, String::new())`。
 /// 3. `declare -p NAME ...`（`args[0] == "-p"` 且 `args.len() >= 2`）：
-///    查 `vars.get(NAME)`：
+///    先校验 NAME 合法性，非法则 stderr 报错并短路（**不**进 not-found 分支）；
+///    合法则查 `vars.get(NAME)`：
 ///    - Some(v) → stdout `declare -- NAME="{escape(v)}"\n`
 ///    - None    → stderr `declare: NAME: not found\n`
 /// 4. 其它形态（空 args / `declare -p` 缺 NAME / `declare -x` 等）：
 ///    静默 `Ok(())`，绝不向 sink/err_sink 写任何字节，避免污染 tester。
+///
+/// ## NAME 合法性校验
+///
+/// 由私有 helper `is_valid_identifier` 实现，规则
+/// `^[A-Za-z_][A-Za-z0-9_]*$`、ASCII-only。校验插入点：
+///
+/// - 路径 1/2：`splitn(2, '=')` 拆出 NAME 段后立刻校验；**错误信息引号
+///   内回显的是函数收到的原 arg `first` 全文（含 `=VALUE`）**，例如
+///   `declare 67=x` → ``declare: `67=x': not a valid identifier``
+/// - 路径 3：`let name = &args[1]` 后、查 store 前校验；**错误信息引号
+///   内回显的是 NAME 本身（`args[1]`）**，例如 `declare -p 67` →
+///   ``declare: `67': not a valid identifier``
+///
+/// 空 NAME（`declare =foo`、`declare =`）天然落入非法分支：空串首字符
+/// 不存在，`is_valid_identifier` 返回 false。校验失败统一 `return Ok(())`，
+/// 不写 store、不进 not-found、不打断 REPL。
 ///
 /// ## 关键设计决策
 ///
 /// - **VALUE 解析仅 splitn(2, '=')**：args 已被 parser 完成空白拆分 + 引号脱壳，
 ///   `run_declare` 视角下每个 arg 是独立 token；首个 `=` 为分隔符，其后任意
 ///   `=` 都属于 VALUE 内容。
-/// - **NAME 不做合法标识符校验**：题面 tester 用例（`foo` / `missing_variable`）
-///   都合法；bash 真实的 valid-identifier 错误分支本阶段不实现，超纲。
 /// - **`-p` 多 NAME 仅查首个**：`args[1]` 是首个 NAME；本阶段未实现
 ///   `declare -p A B` 多 NAME 批量查询，超出 tester 范围。
 /// - **「非主路径全静默 Ok」契约延续**：第一阶段占位 arm 注释强调的「declare
@@ -642,8 +689,8 @@ fn escape_for_double_quote(s: &str) -> String {
 ///
 /// ## sink / err_sink 参数
 ///
-/// 本阶段两路都可能写：`-p` 命中走 stdout、未命中走 stderr。两个 dyn Write
-/// 入参的所有路径都已被消费，无 unused 警告。
+/// 本阶段两路都可能写：`-p` 命中走 stdout、未命中 / NAME 非法走 stderr。
+/// 两个 dyn Write 入参的所有路径都已被消费，无 unused 警告。
 pub fn run_declare(
     sink: &mut dyn Write,
     err_sink: &mut dyn Write,
@@ -660,6 +707,12 @@ pub fn run_declare(
     if first == "-p" {
         if args.len() >= 2 {
             let name = &args[1];
+            // 校验前置：非法 NAME 短路报错，避免误走 not-found。
+            // 错误信息引号内回显 NAME 本身（args[1]）。
+            if !is_valid_identifier(name) {
+                writeln!(err_sink, "declare: `{}': not a valid identifier", name)?;
+                return Ok(());
+            }
             match vars.get(name) {
                 Some(value) => {
                     let escaped = escape_for_double_quote(value);
@@ -686,10 +739,15 @@ pub fn run_declare(
     let mut iter = first.splitn(2, '=');
     let name = iter.next().unwrap_or(""); // 守卫：splitn 始终至少返回一段
     let value = iter.next().unwrap_or(""); // 不含 `=` → 空串声明（q3 决策）
-    if !name.is_empty() {
-        vars.insert(name.to_string(), value.to_string());
+    // 校验 NAME 合法性：空 NAME（`=foo`）/ 首字符为数字 / 含 `-` 等非法
+    // 字符均拦截。错误信息引号内回显原 arg 全文 `first`（含 `=VALUE`），
+    // 与题面 `declare 67=x` → ``declare: `67=x': not a valid identifier``
+    // verbatim 对齐。
+    if !is_valid_identifier(name) {
+        writeln!(err_sink, "declare: `{}': not a valid identifier", first)?;
+        return Ok(());
     }
-    // NAME 为空（如 `declare =foo`）：静默 Ok，避免污染 store 与输出。
+    vars.insert(name.to_string(), value.to_string());
     Ok(())
 }
 
@@ -1228,10 +1286,12 @@ mod tests {
 
     #[test]
     fn declare_p_any_unset_name_is_not_found() {
-        // 空 store 下任意 NAME 都走 not-found 分支，且错误信息 NAME
-        // 直接来自 args 原文回显（不做合法标识符校验）。
+        // 空 store 下任意**合法**标识符 NAME 都走 not-found 分支，错误信息
+        // NAME 直接来自 args 原文回显。本阶段加入 valid-identifier 校验后，
+        // 非法 NAME（如 `weird-name` / `0bad`）会被前置拦截到
+        // not-a-valid-identifier 分支——非法用例已迁移到独立测试覆盖。
         let mut vars: HashMap<String, String> = HashMap::new();
-        for name in &["FOO", "x", "Some_Var123", "weird-name", "0bad"] {
+        for name in &["FOO", "x", "Some_Var123", "alpha_1"] {
             let (out, err) = invoke_declare(&["-p", name], &mut vars);
             assert!(out.is_empty(), "-p {} 未命中不写 stdout", name);
             assert_eq!(err, format!("declare: {}: not found\n", name));
@@ -1357,5 +1417,127 @@ mod tests {
         let (out, err) = invoke_declare(&["-p", "x"], &mut vars);
         assert_eq!(out, "declare -- x=\"1\"\n");
         assert!(err.is_empty());
+    }
+
+    // ---- Stage「Validating identifiers」：NAME 合法性校验用例 ----
+
+    #[test]
+    fn declare_invalid_name_starts_with_digit_with_value() {
+        // 题面 verbatim 用例：`declare 67=x` →
+        // stderr ``declare: `67=x': not a valid identifier\n``，stdout 空，
+        // store 不应被写入（既无 "67" 键，也无任何键）。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["67=x"], &mut vars);
+        assert!(out.is_empty(), "非法 NAME 不写 stdout");
+        assert_eq!(err, "declare: `67=x': not a valid identifier\n");
+        assert!(vars.is_empty(), "非法 NAME 不应写入 store");
+    }
+
+    #[test]
+    fn declare_invalid_name_starts_with_digit_no_value() {
+        // 单参形态 `declare 67`：错误信息引号内回显原 arg = "67"
+        // （此时不含 `=`，原 arg 即 NAME 本身）。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["67"], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `67': not a valid identifier\n");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn declare_invalid_name_with_dash() {
+        // `-` 不在合法集（^[A-Za-z_][A-Za-z0-9_]*$）：
+        // `weird-name=v` 非法，引号内回显原 arg `weird-name=v`。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["weird-name=v"], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `weird-name=v': not a valid identifier\n");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn declare_empty_name_is_invalid() {
+        // q3 决策：空 NAME（`=foo`、首字符即为 `=`）走非法分支。
+        // 引号内回显原 arg `=foo`。store 不应含任何键（含空串键）。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["=foo"], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `=foo': not a valid identifier\n");
+        assert!(vars.is_empty(), "空 NAME 不应写入 store（含空串键）");
+
+        // 边界：仅 `=` 也属空 NAME 且 value 也空
+        let (out, err) = invoke_declare(&["="], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `=': not a valid identifier\n");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn declare_p_invalid_name_reports_invalid_not_not_found() {
+        // 路径 3 校验前置：`declare -p 67` 非法 NAME，应报
+        // not-a-valid-identifier 而**不是** not-found。引号内回显 args[1]
+        // = "67"（NAME 本身，因为 -p 路径下 args[1] 没有 `=VALUE` 后缀）。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["-p", "67"], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `67': not a valid identifier\n");
+        assert!(
+            !err.contains("not found"),
+            "非法 NAME 不应走 not-found 分支，实际 err = {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn declare_valid_underscore_prefix_accepted() {
+        // 题面 verbatim 序列：`declare _FOO=BAR` 写入 → `declare -p _FOO`
+        // 输出 `declare -- _FOO="BAR"\n`。验证下划线开头 NAME 合法。
+        let mut vars: HashMap<String, String> = HashMap::new();
+        let (out, err) = invoke_declare(&["_FOO=BAR"], &mut vars);
+        assert!(out.is_empty(), "合法写入路径不写 stdout");
+        assert!(err.is_empty(), "合法写入路径不写 stderr");
+        assert_eq!(vars.get("_FOO").map(String::as_str), Some("BAR"));
+
+        let (out, err) = invoke_declare(&["-p", "_FOO"], &mut vars);
+        assert_eq!(out, "declare -- _FOO=\"BAR\"\n");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn declare_valid_alpha_then_alnum_underscore() {
+        // 多组合法 NAME 矩阵：单字母 / 大写下划线 / 含数字 / 单下划线 /
+        // 下划线带数字。每组应静默 Ok 且 store 含对应键。
+        let valid_names = ["a", "A_1", "foo_bar_123", "_", "_1"];
+        for name in &valid_names {
+            let mut vars: HashMap<String, String> = HashMap::new();
+            let assign = format!("{}=v", name);
+            let (out, err) = invoke_declare(&[assign.as_str()], &mut vars);
+            assert!(out.is_empty(), "合法 NAME {:?} 不应写 stdout", name);
+            assert!(err.is_empty(), "合法 NAME {:?} 不应写 stderr", name);
+            assert_eq!(
+                vars.get(*name).map(String::as_str),
+                Some("v"),
+                "合法 NAME {:?} 应被写入 store",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn declare_invalid_then_valid_with_same_name_root() {
+        // 非法路径不污染后续合法写入：`declare 1foo=x` → 报错且不写 store；
+        // 紧接 `declare foo=x` → 正常写入 foo。
+        let mut vars: HashMap<String, String> = HashMap::new();
+
+        let (out, err) = invoke_declare(&["1foo=x"], &mut vars);
+        assert!(out.is_empty());
+        assert_eq!(err, "declare: `1foo=x': not a valid identifier\n");
+        assert!(vars.is_empty(), "非法路径不应写入 store");
+
+        let (out, err) = invoke_declare(&["foo=x"], &mut vars);
+        assert!(out.is_empty(), "后续合法写入不写 stdout");
+        assert!(err.is_empty(), "后续合法写入不写 stderr");
+        assert_eq!(vars.get("foo").map(String::as_str), Some("x"));
+        assert_eq!(vars.len(), 1, "store 应仅含合法键 foo");
     }
 }
