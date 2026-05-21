@@ -262,6 +262,54 @@ fn main() {
                     continue;
                 }
 
+                // Stage「history -w <path>」：把内存中的全部历史条目按时序覆盖写入文件，
+                // 末尾保留一个尾换行（题面 displayed as an empty line）。
+                //
+                // 决策依据（与 -r 对称）：
+                // - 仍放在 dispatch 层而非 `run_history`：写文件与「stdout 渲染」职责正交，
+                //   `run_history` 拿 `&[String]` 只读视图无需也不应感知文件系统；现有 11 个
+                //   单测契约是「输入 entries → 输出渲染格式」，混入文件路径依赖会污染可测性。
+                // - 入栈顺序：`history -w <path>` 这条命令本身已在 dispatch 前（main 第 118 行
+                //   `editor.add_history_entry(line)`）入栈，因此进入本分支时它已是历史最末
+                //   一条，写出文件最后一行（在尾 `\n` 之前）正是它，与题面期望逐字节匹配。
+                //
+                // 关键技术点：
+                // - `File::create`（= O_WRONLY|O_CREAT|O_TRUNC）实现「不存在则创建、存在则
+                //   覆盖」语义，对应 bash `-w` 标准行为；不能用 `OpenOptions::append`，否则
+                //   会保留旧内容、污染题面期望的「文件内容 = 当次会话精确历史」。
+                // - `writeln!` 自动加 `\n`，覆盖「最后一行也要尾换行」需求；优于 `write!` +
+                //   手动拼接（容易遗漏边界）。
+                // - `BufWriter` + 显式 `flush()`：减少系统调用次数；Drop 时 flush 会静默
+                //   吞错，显式 flush 让错误路径明确（即便后续仍走静默忽略策略）。
+                //
+                // 边界处理（与 -r 静默风格对称）：
+                // - 文件创建 / 写入 / flush 失败：`if let Ok` / `let _ =` 静默忽略，不写
+                //   stderr、不阻断 REPL。
+                // - 多余参数：仅取 `args.get(1)` 作路径，`args[2..]` 静默忽略。
+                // - 缺路径（仅 `-w`）：`args.get(1)` 返回 None，静默 continue。
+                if args.first().map(|s| s.as_str()) == Some("-w") {
+                    if let Some(path) = args.get(1) {
+                        // 沿用下方渲染路径同款收集方式（Forward 顺序 = 用户输入时序 =
+                        // history 编号 1..N 顺序），避免引入第二种遍历模式造成认知分裂。
+                        let h = editor.history();
+                        let mut entries: Vec<String> = Vec::with_capacity(h.len());
+                        for i in 0..h.len() {
+                            if let Ok(Some(sr)) = h.get(i, SearchDirection::Forward) {
+                                entries.push(sr.entry.into_owned());
+                            }
+                        }
+                        if let Ok(file) = std::fs::File::create(path) {
+                            use std::io::Write;
+                            let mut w = std::io::BufWriter::new(file);
+                            for entry in &entries {
+                                let _ = writeln!(w, "{}", entry);
+                            }
+                            let _ = w.flush();
+                        }
+                    }
+                    continue;
+                }
+
                 // Stage「history as a shell builtin」：从 rustyline editor 内部 history
                 // 收集本会话所有条目为 Vec<String>，再调用 `run_history` 渲染。
                 //
