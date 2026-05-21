@@ -572,6 +572,59 @@ pub fn run_history(
     Ok(())
 }
 
+/// `declare` 内建：本阶段仅实现 `-p NAME` 的「变量不存在」分支。
+///
+/// ## 题面契约（codecrafters「declare -p flag (not-found branch)」）
+///
+/// `declare -p NAME` 在 NAME 未被定义时向 stderr 打印
+/// `declare: <NAME>: not found`（writeln 自带末尾换行）。
+///
+/// ## 本阶段实现策略：硬编码视作「全部不存在」
+///
+/// 题面 Notes 明确「You can hardcode the output of the declare builtin for
+/// this stage. We'll get to implementing storing shell variables in the later
+/// stages.」——本阶段尚无变量存储后端，故所有 `-p NAME` 调用统一视作
+/// NAME 不存在；后续阶段把 not-found 分支改为「先查存储、未命中再报错」即可，
+/// 调用点签名不动。
+///
+/// ## 行为表
+///
+/// - `declare -p NAME`（任何 NAME）：stderr `declare: NAME: not found`
+/// - `declare -p`（缺 NAME）/ `declare`（无参）/ `declare var=value` /
+///   其它形式：静默 `Ok(())`，绝不向 sink/err_sink 写任何字节。
+///
+/// 「非 -p NAME 路径全部静默 Ok」是第一阶段占位 arm 注释强调的契约延续——
+/// 不能让 declare 调用走 `run_external` 报 `command not found`，违反
+/// `type declare` 声称是 builtin 的一致性。
+///
+/// ## 不强制 NAME 合法标识符校验
+///
+/// `<NAME>` 直接来自 `args[1]` 原文回显，不做 bash valid identifier 校验。
+/// 题面只规定 `not found` 一种错误形式，未提及 `not a valid identifier` 分支；
+/// tester 用例 `missing_variable` 本身合法，无歧义。
+///
+/// ## sink 参数保留原因
+///
+/// 本阶段函数体不写 stdout，`sink` 参数仅作为后续阶段「-p 命中分支」
+/// （需要写 `declare -- name="value"` 到 stdout）的预留挂载点，避免
+/// 后续阶段动调用点签名。dyn Write 引用作为入参不会触发 unused 警告。
+pub fn run_declare(
+    sink: &mut dyn Write,
+    err_sink: &mut dyn Write,
+    args: &[String],
+) -> io::Result<()> {
+    // 占位消费 sink 以明确表达「本阶段刻意不写 stdout」的意图，
+    // 同时保留参数为后续 -p 命中分支预留挂载点。
+    let _ = sink;
+
+    // 仅 `-p NAME ...` 主路径写错误；其它形态一律静默 Ok。
+    if args.len() >= 2 && args[0] == "-p" {
+        let name = &args[1];
+        writeln!(err_sink, "declare: {}: not found", name)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1075,5 +1128,59 @@ mod tests {
             invoke_history_with_args(&["a", "b", "c"], &["2", "ignored", "junk"]);
         assert_eq!(out, "   2  b\n   3  c\n");
         assert!(err.is_empty());
+    }
+
+    // ---- Stage「declare -p flag (not-found branch)」：run_declare 用例 ----
+
+    /// 跑 `run_declare` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。
+    fn invoke_declare(args: &[&str]) -> (String, String) {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        run_declare(&mut sink, &mut err, &owned).expect("run_declare");
+        (
+            String::from_utf8(sink).expect("utf8 stdout"),
+            String::from_utf8(err).expect("utf8 stderr"),
+        )
+    }
+
+    #[test]
+    fn declare_p_missing_variable_writes_stderr() {
+        // 题面核心断言：`declare -p missing_variable` →
+        // stderr `declare: missing_variable: not found\n`，stdout 空。
+        let (out, err) = invoke_declare(&["-p", "missing_variable"]);
+        assert!(out.is_empty(), "-p NAME 不写 stdout");
+        assert_eq!(err, "declare: missing_variable: not found\n");
+    }
+
+    #[test]
+    fn declare_p_any_name_treated_as_missing() {
+        // 验证「硬编码视作所有 NAME 不存在」契约：换多个 NAME 均走 not-found 分支，
+        // 且错误信息中的 NAME 直接来自 args 原文回显（不做合法标识符校验）。
+        for name in &["FOO", "x", "Some_Var123", "weird-name", "0bad"] {
+            let (out, err) = invoke_declare(&["-p", name]);
+            assert!(out.is_empty(), "-p {} 不写 stdout", name);
+            assert_eq!(err, format!("declare: {}: not found\n", name));
+        }
+    }
+
+    #[test]
+    fn declare_silent_paths_no_output() {
+        // 验证非 `-p NAME` 路径全部静默 Ok：不写 stdout/stderr，避免污染或回归。
+        // 对应第一阶段占位 arm 注释强调的「declare 调用绝不报 command not found」契约。
+        for args in &[
+            // 空 args（直接输入 `declare`）
+            &[][..],
+            // `-p` 缺 NAME
+            &["-p"][..],
+            // 形如 `declare foo=bar`：本阶段不实现存储，静默
+            &["foo=bar"][..],
+            // 未知 flag：本阶段不报错，静默
+            &["-x"][..],
+        ] {
+            let (out, err) = invoke_declare(args);
+            assert!(out.is_empty(), "args {:?} 不应写 stdout，实际 {:?}", args, out);
+            assert!(err.is_empty(), "args {:?} 不应写 stderr，实际 {:?}", args, err);
+        }
     }
 }

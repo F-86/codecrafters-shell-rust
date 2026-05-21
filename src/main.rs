@@ -10,8 +10,8 @@ mod parser;
 mod redirect;
 
 use builtins::{
-    advance_job_status, render_done_jobs, retain_running_jobs, run_cd, run_complete, run_echo,
-    run_history, run_jobs, run_pwd, run_type, Job,
+    advance_job_status, render_done_jobs, retain_running_jobs, run_cd, run_complete, run_declare,
+    run_echo, run_history, run_jobs, run_pwd, run_type, Job,
 };
 use completion::ShellHelper;
 use exec::{run_external, run_pipeline};
@@ -492,18 +492,23 @@ fn main() {
                     eprintln!("shell: write error: {}", e);
                 }
             }
-            // Stage「register the declare builtin」：本阶段仅注册 builtin（BUILTINS
-            // 数组已追加 "declare"），让 `type declare` 命中 "is a shell builtin"
-            // 分支即可。题面 Notes 明确「only need to register」，不实现
-            // `declare variable=value` / `declare -p variable` 等子命令行为。
+            // Stage「declare -p flag (not-found branch)」：实现 `declare -p NAME`
+            // 在 NAME 未定义时向 stderr 打印 `declare: NAME: not found`。
+            // 题面 Notes 明确「hardcode the output for this stage」——本阶段尚无
+            // 变量存储后端，`run_declare` 内部把所有 `-p NAME` 调用统一视作
+            // NAME 不存在；其它形态（`declare` 无参 / `declare -p` 缺 NAME /
+            // `declare foo=bar` 等）静默 Ok，待后续阶段实现。
             //
-            // 此占位 arm 必须位于 `_ => run_external` 之前，否则用户在 REPL 直接输入
+            // 此 arm 必须位于 `_ => run_external` 之前，否则用户在 REPL 直接输入
             // `declare foo=bar` 会落入兜底走 PATH 查找并打印 `declare: command not found`，
             // 违反「`type` 声称是 builtin、执行也应按 builtin 处理」的契约一致性。
             //
-            // 后续阶段实现行为时，把空 `{}` 替换为 `run_declare(...)` 调用即可，沿用
-            // `run_complete` / `run_history` 的 `if let Err(e) = ...` IO 错误包裹模板。
-            "declare" => {}
+            // IO 错误包裹模板与上方 `run_history` 调用一字不差对齐。
+            "declare" => {
+                if let Err(e) = run_declare(&mut *sink, &mut *err_sink, args) {
+                    eprintln!("shell: write error: {}", e);
+                }
+            }
             _ => {
                 run_external(cmd, line, args, &parsed, sink, err_sink, &jobs_table);
             }
