@@ -26,6 +26,7 @@
 //! - stdout 追加：`>>` / `1>>`（等价）
 //! - stderr 截断：`2>`
 //! - stderr 追加：`2>>`
+//!
 //! 把其后第一个 token 作为对应目标，剩余 token 作为 argv，组装出 [`ParsedCommand`]。
 //!
 //! 此外，若 token 序列末尾恰好是单独的 `"&"`，parse 层会先 pop 之并把
@@ -57,7 +58,12 @@ mod tokenize;
 #[cfg(test)]
 mod tests;
 
-pub use parse::{parse, ParsedCommand};
+pub use parse::{parse_pipeline, ParsedCommand, Pipeline};
+// `parse` 是单命令兼容 wrapper，仅供 parser 内部 `#[cfg(test)]` 单元测试调用——
+// REPL 主路径已切到 `parse_pipeline`。对外仍 re-export 以保持 API 稳定（未来扩展
+// 或外部嵌入测试可直接调用），并把「未使用」警告收敛到 parse.rs 的 `#[cfg_attr]` 上。
+#[cfg(test)]
+pub use parse::parse;
 // `tokenize` 当前仅供 parser 内部 `parse` 与 `#[cfg(test)] mod tests` 使用，
 // 但作为词法层稳定 API 仍对外暴露——若未来 main 或新模块需直接调用 tokenize
 // （例如做语法高亮、补全），此 re-export 提供零成本入口。
@@ -78,6 +84,10 @@ pub enum ParseError {
     /// 任一重定向操作符（`>` / `1>` / `2>` / `>>` / `1>>` / `2>>`）后没有目标文件 token，
     /// 例如 `echo hello >`、`ls 2>`、`echo a >>`。
     MissingRedirectTarget,
+    /// pipeline 中存在空段：开头 `|`（如 `| ls`）、末尾 `|`（如 `ls |`）、连续 `||`
+    /// （如 `ls | | cat` 或 `a || b`）。本阶段不实现 `||` 逻辑 OR，连续 `|` 一律视为
+    /// 空 stage 报错；未来如需支持 `||` 可在 tokenize 层先合并为独立 `"||"` token 再扩展。
+    EmptyPipelineSegment,
 }
 
 impl fmt::Display for ParseError {
@@ -94,6 +104,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::MissingRedirectTarget => {
                 write!(f, "syntax error: missing redirect target")
+            }
+            ParseError::EmptyPipelineSegment => {
+                write!(f, "syntax error: empty pipeline segment")
             }
         }
     }

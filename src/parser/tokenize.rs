@@ -93,6 +93,27 @@ pub fn tokenize(input: &str) -> Result<Vec<String>, ParseError> {
                     }
                     in_token = false;
                 }
+                '|' => {
+                    // Pipeline 分隔符 `|`：在引号外作为独立 token 切出，
+                    // 与 `>` / `&` 切分规则对称（无论前是否有空白）。
+                    //
+                    // 设计要点：
+                    // - 引号外 `|` 永远独立成 token，使 parse 层只需按 `"|"` 切分子序列，
+                    //   即可识别 N 段 pipeline，逻辑最简、无歧义。
+                    // - 引号内（InSingleQuote / InDoubleQuote）的 `|` 不会进入这里——
+                    //   那两个分支对一切非闭合字符按字面量保留——故 `echo "|"` / `echo '|'`
+                    //   仍输出字面 `|`，不触发 pipeline 语义。
+                    // - 引号外反斜杠转义 `\|` 同样在 Normal 态 `\\` 分支先于此分支处理，
+                    //   下一字符被消费为字面量，绕过本分支。
+                    // - 本阶段不实现 `||`（逻辑 OR）：连续两个 `|` 切成两个独立 `"|"` token，
+                    //   由 parse 层经空 stage 检测命中 `EmptyPipelineSegment` 错误——这与 bash
+                    //   缺少 `||` 实现时最近似行为（用户能立即得知语法错误）。
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                    tokens.push("|".to_string());
+                    in_token = false;
+                }
                 '&' => {
                     // 后台执行操作符 `&`：在引号外作为独立 token 切出，
                     // 与 `>` 切分规则对称（无论前是否有空白）。

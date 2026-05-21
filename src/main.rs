@@ -14,7 +14,7 @@ use builtins::{
     run_jobs, run_pwd, run_type, Job,
 };
 use completion::ShellHelper;
-use exec::run_external;
+use exec::{run_external, run_pipeline};
 use redirect::{open_err_sink, open_sink};
 use rustyline::error::ReadlineError;
 use rustyline::{Config, CompletionType, Editor};
@@ -107,15 +107,30 @@ fn main() {
             continue;
         }
 
-        // 5. 词法 + 结构化解析：支持引号、转义与 `>` / `1>` 重定向
-        //    解析失败（未闭合引号、孤立反斜杠、`>` 后无目标）打印错误后继续 REPL，不中断进程
-        let parsed = match parser::parse(line) {
+        // 5. 词法 + 结构化解析：支持引号、转义、`>` / `1>` / `2>` 重定向、`|` pipeline 切分。
+        //    解析失败（未闭合引号、孤立反斜杠、`>` 后无目标、空 pipeline 段等）打印错误后
+        //    继续 REPL，不中断进程。
+        let pipeline = match parser::parse_pipeline(line) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("{}", e);
                 continue;
             }
         };
+
+        // 5.5 多段 pipeline 分支：把 sink/err_sink 物化职责下沉到 `run_pipeline` 内按段独立
+        //     处理（每段保留自己的 `>` / `2>` 语义，互不影响），整条 pipeline 的 `&` 由
+        //     `pipeline.background` 统一驱动。中段 builtin 走父进程缓冲方案，详见 `run_pipeline`
+        //     注释。空段已被 parser 拦下，此处必然 `stages.len() >= 1`。
+        if pipeline.stages.len() > 1 {
+            run_pipeline(&pipeline, &jobs_table);
+            continue;
+        }
+
+        // 5.6 单段路径：取唯一段并把 `pipeline.background` 回填到 `ParsedCommand.background`，
+        //     与既有 builtin / `run_external` 调用契约 100% 兼容——本路径零行为变化。
+        let mut parsed = pipeline.stages.into_iter().next().expect("stages.len() >= 1");
+        parsed.background = pipeline.background;
 
         // 仅含空白 / 只有重定向无命令时，argv 为空：跳过下一轮
         if parsed.argv.is_empty() {
@@ -187,7 +202,7 @@ fn main() {
                     &mut *sink,
                     &mut *err_sink,
                     args,
-                    &mut *completions.borrow_mut(),
+                    &mut completions.borrow_mut(),
                 ) {
                     eprintln!("shell: write error: {}", e);
                 }

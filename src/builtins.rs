@@ -50,13 +50,16 @@ impl JobStatus {
 /// - `id`：作业编号（`[N]` 中的 N）。Stage「Recycling Job Numbers」起，
 ///   由 [`allocate_job_id`] 在每次后台 spawn 时基于当前作业表计算「最小可用正整数」
 ///   （表空→1、`[1,3]`→2、`[2,3]`→1），不再单调递增；
-/// - `pid`：子进程 PID（`Command::spawn` 返回的 `Child::id()`，`u32`）；
-/// - `command`：命令字符串，本阶段用 `parsed.argv.join(" ")`（zsh 风格、无尾 `&`、
-///   无重定向片段）。题面明示「trailing `&` 是可选的」，tester 容忍；
+/// - `pid`：单进程作业的 PID；**pipeline 作业**为最后一段（last stage）的 PID，
+///   与 bash 的 `$!` 行为一致。
+/// - `command`：命令字符串，单进程为 `parsed.argv.join(" ")`；**pipeline 作业**
+///   为各段 argv 用 `" | "` 拼接（zsh 风格、无尾 `&`、无重定向片段）；
 /// - `status`：当前状态（`Running` / `Done`）；
-/// - `child`：`std::process::Child` 句柄，本阶段用于 `try_wait()` 非阻塞探测进程
-///   是否已退出。move 进 Job 后由 Vec 持有，Job 被 `retain` 移除时随之 drop——
-///   `try_wait` 成功收尾后无僵尸残留。
+/// - `children`：作业关联的全部 [`Child`] 句柄。
+///   单进程作业为 `vec![child]`；**pipeline 作业**为 `vec![child1, child2, ...]`
+///   按管道顺序排列。状态推进与 reap 时**遍历全部** child：任一仍 `Running` 即整个
+///   Job 仍 `Running`；全部退出（`Ok(Some(_))` 或 `Err(_)`）才转 `Done`。
+///   Job 被 `Vec::retain` 移除时所有 Child 一同 drop——`try_wait` 成功收尾后无僵尸残留。
 ///
 /// 注：因为 `Child` 既不 `Clone` 也不 `Debug`，本结构去除了 `#[derive(Debug, Clone)]`。
 /// 本阶段无 Debug 输出与克隆依赖，无需手写 impl。
@@ -70,7 +73,7 @@ pub struct Job {
     pub pid: u32,
     pub command: String,
     pub status: JobStatus,
-    pub child: Child,
+    pub children: Vec<Child>,
 }
 
 /// 按 PATH 顺序查找可执行文件。
@@ -271,11 +274,16 @@ pub fn run_complete(
 
 /// 非阻塞推进作业表中所有 `Running` 项的状态。
 ///
-/// 实现细节：对每个 `Running` 项调用 `Child::try_wait()`（`waitpid(WNOHANG)` 风格）：
-/// - `Ok(Some(_))`：子进程已退出，标记为 `Done`；`Child` 内部已被 reap，无僵尸；
-/// - `Ok(None)`：仍存活，保持 `Running`；
-/// - `Err(_)`：极罕见（如已被外部信号处理器 reap 导致 ECHILD），防御性视为 `Done`，
-///   避免僵尸或卡死表项。
+/// 实现细节：对每个 `Running` 项**遍历其所有 `children`** 调用 `Child::try_wait()`
+/// （`waitpid(WNOHANG)` 风格）：
+/// - 任一 child `Ok(None)`（仍存活）→ 整个 Job 保持 `Running`，跳到下一 Job；
+/// - 所有 children 均 `Ok(Some(_))` 或 `Err(_)` → 标记为 `Done`。
+///   `Ok(Some(_))` 表示已退出且本调用完成 reap；`Err(_)`（极罕见，如已被外部信号
+///   处理器 reap 导致 ECHILD）防御性视为 Done，避免僵尸或卡死表项。
+///
+/// **pipeline 语义**：N 段 pipeline 中任一段（如 `tail -f`）可能因 SIGPIPE 退出，
+/// 而其他段（如 `head -n 5`）则因正常退出条件结束。本函数等所有段都终止才转 Done，
+/// 与 bash `wait` pipeline 的行为一致。
 ///
 /// 本函数为「Reaping Before Each Prompt」三函数原子拆分中的第一步：仅推进状态，
 /// 不渲染任何字节、不修改 Vec 长度。渲染由 [`render_done_jobs`] 承担，移除由
@@ -286,10 +294,18 @@ pub fn advance_job_status(jobs: &mut [Job]) {
         if job.status != JobStatus::Running {
             continue;
         }
-        match job.child.try_wait() {
-            Ok(Some(_)) => job.status = JobStatus::Done,
-            Ok(None) => {} // 仍存活
-            Err(_) => job.status = JobStatus::Done,
+        // 遍历该 Job 的所有 child；任一仍 Running 即保持 Running，
+        // 全部退出（Ok(Some) 或 Err）才转 Done。
+        let mut all_finished = true;
+        for child in job.children.iter_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}                  // 已退出并 reap
+                Ok(None) => all_finished = false,  // 仍存活
+                Err(_) => {}                       // 防御性：ECHILD，视为已结束
+            }
+        }
+        if all_finished {
+            job.status = JobStatus::Done;
         }
     }
 }
@@ -544,7 +560,7 @@ mod tests {
             pid,
             command: command.to_string(),
             status: JobStatus::Running,
-            child,
+            children: vec![child],
         }
     }
 
@@ -567,14 +583,16 @@ mod tests {
             pid,
             command: command.to_string(),
             status: JobStatus::Running,
-            child,
+            children: vec![child],
         }
     }
 
-    /// 杀掉 Running Job 的 child，避免测试遗留。Done Job 已被 reap，无需处理。
+    /// 杀掉 Running Job 的所有 child，避免测试遗留。Done Job 已被 reap，无需处理。
     fn kill_job(job: &mut Job) {
-        let _ = job.child.kill();
-        let _ = job.child.wait();
+        for child in job.children.iter_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     /// 跑 `run_jobs` 的薄封装：返回 (stdout, stderr) 字符串对，便于断言。

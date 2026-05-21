@@ -891,3 +891,166 @@ fn parse_amp_in_middle_is_literal_argv() {
     assert_eq!(p.argv, vec!["echo", "&", "hi"]);
     assert!(!p.background);
 }
+
+// ===== Pipeline 分隔符 `|`：tokenize 层 =====
+// 目的：确认 `|` 在引号外被切为独立 token（无论前是否有空白）；
+//       引号内 / 转义后仍按字面量；连续 `||` 切成两个独立 `|`，
+//       由 parse 层经空 stage 检测命中错误。
+
+#[test]
+fn tokenize_pipe_unquoted_splits() {
+    // 紧贴形态：`a|b` → `|` 独立 token
+    assert_eq!(
+        tokenize("a|b").unwrap(),
+        vec!["a", "|", "b"]
+    );
+}
+
+#[test]
+fn tokenize_pipe_with_spaces() {
+    // 空格分隔形态：`a | b` → 三 token
+    assert_eq!(
+        tokenize("a | b").unwrap(),
+        vec!["a", "|", "b"]
+    );
+    // 三段 pipeline：`cat f | head -n 2 | wc -l`
+    assert_eq!(
+        tokenize("cat f | head -n 2 | wc -l").unwrap(),
+        vec!["cat", "f", "|", "head", "-n", "2", "|", "wc", "-l"]
+    );
+}
+
+#[test]
+fn tokenize_pipe_quoted_literal() {
+    // 单引号内 `|` 是字面量
+    assert_eq!(
+        tokenize("echo '|'").unwrap(),
+        vec!["echo", "|"]
+    );
+    assert_eq!(
+        tokenize("echo 'a|b'").unwrap(),
+        vec!["echo", "a|b"]
+    );
+    // 双引号内 `|` 是字面量
+    assert_eq!(
+        tokenize(r#"echo "a|b""#).unwrap(),
+        vec!["echo", "a|b"]
+    );
+    // 引号外反斜杠转义 `\|` → 字面 `|`，与前一字符拼接为同一 token
+    assert_eq!(
+        tokenize(r"echo a\|b").unwrap(),
+        vec!["echo", "a|b"]
+    );
+}
+
+#[test]
+fn tokenize_double_pipe_two_independent_tokens() {
+    // `a||b` → 两个独立 `|` token 中间夹空 stage；parse 层将报 EmptyPipelineSegment
+    assert_eq!(
+        tokenize("a||b").unwrap(),
+        vec!["a", "|", "|", "b"]
+    );
+    assert_eq!(
+        tokenize("a || b").unwrap(),
+        vec!["a", "|", "|", "b"]
+    );
+}
+
+// ===== Pipeline 结构：parse_pipeline 多段解析 =====
+
+#[test]
+fn parse_pipeline_two_stages() {
+    let p = parse_pipeline("cat f | wc").unwrap();
+    assert_eq!(p.stages.len(), 2);
+    assert_eq!(p.stages[0].argv, vec!["cat", "f"]);
+    assert_eq!(p.stages[1].argv, vec!["wc"]);
+    assert!(!p.background);
+}
+
+#[test]
+fn parse_pipeline_three_stages() {
+    let p = parse_pipeline("a | b | c").unwrap();
+    assert_eq!(p.stages.len(), 3);
+    assert_eq!(p.stages[0].argv, vec!["a"]);
+    assert_eq!(p.stages[1].argv, vec!["b"]);
+    assert_eq!(p.stages[2].argv, vec!["c"]);
+    assert!(!p.background);
+}
+
+#[test]
+fn parse_pipeline_single_stage_no_pipe() {
+    // 无 `|` → 单段 pipeline；background 跟随末尾 `&`
+    let p = parse_pipeline("echo hi").unwrap();
+    assert_eq!(p.stages.len(), 1);
+    assert_eq!(p.stages[0].argv, vec!["echo", "hi"]);
+    assert!(!p.background);
+}
+
+#[test]
+fn parse_pipeline_with_background() {
+    let p = parse_pipeline("a | b &").unwrap();
+    assert_eq!(p.stages.len(), 2);
+    assert_eq!(p.stages[0].argv, vec!["a"]);
+    assert_eq!(p.stages[1].argv, vec!["b"]);
+    assert!(p.background);
+    // 子段 background 字段始终 false——后台是 pipeline 级别属性
+    assert!(!p.stages[0].background);
+    assert!(!p.stages[1].background);
+}
+
+#[test]
+fn parse_pipeline_with_redirect_each_stage() {
+    let p = parse_pipeline("cat f > out | wc 2> err").unwrap();
+    assert_eq!(p.stages.len(), 2);
+    assert_eq!(p.stages[0].argv, vec!["cat", "f"]);
+    assert_eq!(p.stages[0].stdout_redirect, Some("out".to_string()));
+    assert_eq!(p.stages[0].stderr_redirect, None);
+    assert_eq!(p.stages[1].argv, vec!["wc"]);
+    assert_eq!(p.stages[1].stdout_redirect, None);
+    assert_eq!(p.stages[1].stderr_redirect, Some("err".to_string()));
+}
+
+#[test]
+fn parse_pipeline_empty_first_segment_errors() {
+    assert_eq!(
+        parse_pipeline("| ls"),
+        Err(ParseError::EmptyPipelineSegment)
+    );
+}
+
+#[test]
+fn parse_pipeline_empty_last_segment_errors() {
+    assert_eq!(
+        parse_pipeline("ls |"),
+        Err(ParseError::EmptyPipelineSegment)
+    );
+}
+
+#[test]
+fn parse_pipeline_empty_middle_segment_errors() {
+    assert_eq!(
+        parse_pipeline("ls | | cat"),
+        Err(ParseError::EmptyPipelineSegment)
+    );
+}
+
+#[test]
+fn parse_pipeline_double_pipe_errors() {
+    // `a || b` → 中间空 stage 触发 EmptyPipelineSegment（本阶段不实现逻辑 OR）
+    assert_eq!(
+        parse_pipeline("a || b"),
+        Err(ParseError::EmptyPipelineSegment)
+    );
+}
+
+#[test]
+fn parse_single_command_still_works_via_compat_wrapper() {
+    // parse 兼容 wrapper：单段输入仍返回 ParsedCommand，与既有调用方零回归
+    let p = parse("echo hello world").unwrap();
+    assert_eq!(p.argv, vec!["echo", "hello", "world"]);
+    assert!(!p.background);
+
+    let p = parse("sleep 30 &").unwrap();
+    assert_eq!(p.argv, vec!["sleep", "30"]);
+    assert!(p.background);
+}

@@ -1,6 +1,10 @@
 //! 语法层：在 token 序列基础上识别 6 类重定向操作符，组装出结构化命令。
 //!
 //! 详见父模块 [`crate::parser`] 头注释中关于 stdout/stderr 正交性的设计说明。
+//!
+//! 本模块同时承担 pipeline 解析：[`parse_pipeline`] 按引号外 `|` token 切分 N 段命令，
+//! 每段独立保留 `>` / `>>` / `2>` / `2>>` 语义；末尾 `&` 仅作用于整条 pipeline。
+//! [`parse`] 保留为单命令兼容 wrapper（内部调 `parse_pipeline` 后断言 stages.len()==1）。
 
 use super::tokenize::tokenize;
 use super::ParseError;
@@ -26,60 +30,43 @@ pub struct ParsedCommand {
     pub stderr_redirect: Option<String>,
     /// stderr 追加模式标志：`true` 表示用 `2>>`；`false` 表示用 `2>` 或未指定重定向。
     /// `stderr_redirect == None` 时该字段无意义，固定为 `false`。
-    ///
-    /// 与 `stdout_redirect` / `stdout_append` 完全正交：可单独追加 stderr 同时保留
-    /// stdout 终端输出（如 `cmd 2>> err` —— stdout 仍 inherit 到终端），亦可同时设置
-    /// 两套追加（如 `cmd >> out 2>> err`），两文件独立 append。
     pub stderr_append: bool,
-    /// 末尾 `&` 触发的后台执行标志：`true` 表示外部命令需 `spawn` 而不 `wait`，
-    /// 并由 REPL 打印 `[<job>] <pid>` 通知。
+    /// 末尾 `&` 触发的后台执行标志。
     ///
-    /// 仅当 [`tokenize`] 后的最后一个 token 严格为 `"&"` 时置位：parse 层先 pop
-    /// 末尾 token，再走重定向扫描，故 `sleep 30 > out &` 与 `sleep 30 & > out`
-    /// 在本阶段语义有别——前者识别为 (重定向 + 后台)，后者中部的 `&` 因不在末尾
-    /// 而按普通字面量参数留在 argv（本阶段简化，与 bash 复合后台分隔语义偏离；
-    /// codecrafters 后续阶段如需支持 `cmd1 & cmd2` 形式再扩展）。
-    ///
-    /// **已知限制**：tokenizer 当前输出扁平 `Vec<String>`，不携带 token 类型标签，
-    /// 故无论 `&` 来源是引号外操作符、双引号内字面量（`echo "&"`）、单引号内字面量
-    /// （`echo '&'`）还是引号外转义（`echo \&`），只要在 token 序列末尾呈现为孤立
-    /// 字符串 `"&"`，都会被本字段识别为后台标记。该边界与 bash 真实行为有偏差，
-    /// codecrafters 测试不覆盖，作为已知简化保留——未来引入
-    /// `enum Token { Word(String), Op(String) }` 元数据后可精确区分。
-    ///
-    /// builtin 分支当前忽略此字段——builtin 在父进程内同步运行，没有「子进程」
-    /// 可 spawn；真正的 bash 行为下 `echo hi &` 是 fork 子 shell 执行 builtin，
-    /// 超出本阶段范围，留作未来扩展。
+    /// **pipeline 时代语义**：本字段仅在 [`parse`]（单命令 wrapper）路径下由 `parse_pipeline`
+    /// 的 `Pipeline.background` 回填——pipeline 时代后台标志的权威是 [`Pipeline::background`]，
+    /// 单命令路径为保持既有调用方零改动而把同一布尔回写到 `ParsedCommand.background`。
+    /// `parse_pipeline` 直接构造的每段 `ParsedCommand.background` 固定为 `false`。
     pub background: bool,
 }
 
-/// 把一行输入解析为 [`ParsedCommand`]。
+/// 一条 pipeline：N 段命令 + 整条 pipeline 是否后台运行。
 ///
-/// 内部先调用 [`tokenize`] 得到扁平 token 序列，再分两步处理：
-/// 1. 若末尾 token 严格为 `"&"`，pop 之并置 [`ParsedCommand::background`] = `true`；
-/// 2. 在剩余 token 上单次线性扫描识别 6 类重定向操作符：
-///    `>` / `1>` / `>>` / `1>>`（stdout）与 `2>` / `2>>`（stderr）。把紧随其后的 token
-///    作为对应 `*_redirect` 字段，并按操作符是否含 `>>` 设置 `*_append` 标志。
+/// `stages.len() >= 1` 总成立——单条命令也表示为 `Pipeline { stages: vec![cmd], .. }`，
+/// 由上层 REPL 通过 `stages.len()` 判断走单命令快速路径还是多段串联路径。
 ///
-/// 错误传播：tokenize 阶段的语法错误原样返回；若任一重定向操作符后无下一 token,
-/// 返回 [`ParseError::MissingRedirectTarget`]。重复 / 混用同向重定向（如 `> a >> b`、
-/// `>> a > b`、`2> e1 2>> e2`）取**最后一次**为准——append 标志也跟随最后一次的操作符
-/// 形式更新，与 bash 行为一致。
+/// `background` 仅作用于整条 pipeline（末尾 `&`）；段内 `&` token（如 `cmd1 & | cmd2`）
+/// 不在本阶段语义内——`&` 在每段子序列内若出现于末尾会被剥离，与单命令路径行为一致，
+/// 但因为 `|` 切分逻辑把 `&` 留在前一段子序列内，行为已知简化。
+#[derive(Debug, PartialEq, Eq)]
+pub struct Pipeline {
+    pub stages: Vec<ParsedCommand>,
+    pub background: bool,
+}
+
+/// 把一个子 token 序列（不含 `|` 与末尾 `&`）扫描为 [`ParsedCommand`]。
 ///
-/// 非末尾位置出现的 `&` token（如 `echo & hi`）按普通字面量参数留在 argv，与 bash
-/// 复合后台分隔语义不同。本阶段题面 Notes 明确「only one background job」且都是
-/// 末尾形式，故此简化可接受。
-pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
-    let tokens = tokenize(input)?;
-    // 先识别并剥离末尾 `&`：本阶段 `&` 仅作为「后台执行标记」处理。
-    // 该步骤必须在重定向扫描之前——否则末尾 `&` 会被当作 stderr 重定向目标的
-    // 兄弟节点或 argv 字面量，混淆语义。中间位置的 `&` token 不在此处理，
-    // 它们会落入主扫描的 `_ => argv.push(tok)` 分支按字面量留在 argv（本阶段简化）。
-    let mut tokens = tokens;
-    let background = matches!(tokens.last().map(|s| s.as_str()), Some("&"));
-    if background {
-        tokens.pop();
-    }
+/// 单次线性扫描识别 6 类重定向操作符：
+/// `>` / `1>` / `>>` / `1>>`（stdout）与 `2>` / `2>>`（stderr）。把紧随其后的 token
+/// 作为对应 `*_redirect` 字段，并按操作符是否含 `>>` 设置 `*_append` 标志。
+///
+/// 错误：若任一重定向操作符后无下一 token，返回 [`ParseError::MissingRedirectTarget`]。
+/// 重复 / 混用同向重定向（如 `> a >> b`、`>> a > b`、`2> e1 2>> e2`）取**最后一次**为准——
+/// append 标志也跟随最后一次的操作符形式更新，与 bash 行为一致。
+///
+/// `background` 字段固定置为 `false`：后台标记是 pipeline 级别属性，由 [`parse_pipeline`]
+/// 在 [`Pipeline::background`] 上维护；单命令 [`parse`] wrapper 完成后再回填到本字段。
+fn collect_redirects(tokens: Vec<String>) -> Result<ParsedCommand, ParseError> {
     let mut argv: Vec<String> = Vec::with_capacity(tokens.len());
     let mut stdout_redirect: Option<String> = None;
     let mut stdout_append = false;
@@ -128,6 +115,99 @@ pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
         stdout_append,
         stderr_redirect,
         stderr_append,
-        background,
+        background: false,
     })
+}
+
+/// 把一行输入解析为 [`Pipeline`]：N 段 [`ParsedCommand`] + 整条 pipeline 后台标志。
+///
+/// 处理步骤：
+/// 1. [`tokenize`] 输出扁平 token 序列；
+/// 2. 若末尾 token 严格为 `"&"`，pop 之并置 `Pipeline.background = true`；
+/// 3. 按 `"|"` token 切分剩余序列为多个子序列；
+/// 4. 空子序列（首/末/中间空）→ [`ParseError::EmptyPipelineSegment`]；
+/// 5. 每个子序列调用 [`collect_redirects`] 识别重定向，组装为 [`ParsedCommand`]。
+///
+/// 单条命令（无 `|`）：返回 `Pipeline { stages: vec![single], background }`，上层 REPL
+/// 统一处理 `len() == 1` 走快速路径。
+///
+/// 已知限制：tokenize 输出的扁平 token 不携带类型标签，故 `echo "|"`（双引号内字面 `|`）
+/// 在 token 层与 pipeline 分隔符无区别——但本阶段 tokenize 内部对引号态守护严格，
+/// `|` 仅在 Normal 态被识别为独立 token，引号内字面 `|` 被合并进引号 token 内不会出现
+/// 为单独 `"|"`，故 pipeline 切分不会把字面量误识别为分隔符。
+pub fn parse_pipeline(input: &str) -> Result<Pipeline, ParseError> {
+    let mut tokens = tokenize(input)?;
+    // 先识别并剥离末尾 `&`：本阶段 `&` 仅作为「pipeline 整体后台」标志。
+    let background = matches!(tokens.last().map(|s| s.as_str()), Some("&"));
+    if background {
+        tokens.pop();
+    }
+
+    // 按 `"|"` token 切分子序列。
+    // 注意：tokenize 内部 Normal 态 `|` 永远作为单字符独立 token push（参见
+    // tokenize.rs 中 `|` 分支），故 token == "|" 是 pipeline 分隔符的可靠判据。
+    let mut stages: Vec<ParsedCommand> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut has_pipe = false;
+    for tok in tokens.into_iter() {
+        if tok == "|" {
+            has_pipe = true;
+            if current.is_empty() {
+                // 首段为空（开头 `|`）或连续 `||` 中间空段
+                return Err(ParseError::EmptyPipelineSegment);
+            }
+            stages.push(collect_redirects(std::mem::take(&mut current))?);
+        } else {
+            current.push(tok);
+        }
+    }
+    // 处理最后一段：含 `|` 但末段空（如 `ls |`）→ 错误；
+    // 无 `|` 而 current 空 → 空输入或仅 `&`，stages 为空——保持 stages 为空交由
+    // 上层 REPL 与既有「argv 空跳过」逻辑兼容。
+    if has_pipe {
+        if current.is_empty() {
+            return Err(ParseError::EmptyPipelineSegment);
+        }
+        stages.push(collect_redirects(current)?);
+    } else if !current.is_empty() {
+        stages.push(collect_redirects(current)?);
+    } else {
+        // 完全空（如仅 `&` 或空输入）：仍返回单段空 ParsedCommand，
+        // 与既有 `parse` 行为兼容（上层判 argv.is_empty() 跳过）。
+        stages.push(ParsedCommand {
+            argv: Vec::new(),
+            stdout_redirect: None,
+            stdout_append: false,
+            stderr_redirect: None,
+            stderr_append: false,
+            background: false,
+        });
+    }
+
+    Ok(Pipeline { stages, background })
+}
+
+/// 兼容 wrapper：把输入解析为单条 [`ParsedCommand`]。
+///
+/// 内部调用 [`parse_pipeline`]：
+/// - 若 `stages.len() == 1`：取唯一段，把 `Pipeline.background` 回填到 `ParsedCommand.background`
+///   后返回——既有单元测试与未来 API 调用完全兼容。
+/// - 若 `stages.len() > 1`：返回 [`ParseError::EmptyPipelineSegment`] 兜底（REPL 已切到
+///   [`parse_pipeline`] 直接调用，本分支仅作为防御性回退）。
+///
+/// 保留此函数以避免大量既有 parser 单元测试迁移成本，并对外暴露稳定 API。REPL
+/// 主路径（`main.rs`）不再调用本函数——只在 `#[cfg(test)]` 路径与未来外部调用方使用，
+/// 故对非 test 编译加 `#[allow(dead_code)]` 抑制「未使用」警告。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse(input: &str) -> Result<ParsedCommand, ParseError> {
+    let mut pipeline = parse_pipeline(input)?;
+    if pipeline.stages.len() == 1 {
+        let mut cmd = pipeline.stages.pop().expect("len == 1");
+        cmd.background = pipeline.background;
+        Ok(cmd)
+    } else {
+        // 多段 pipeline 经此 wrapper 调用属于误用——既有单命令调用方收到此错误
+        // 即可定位到「应改用 parse_pipeline」。
+        Err(ParseError::EmptyPipelineSegment)
+    }
 }
