@@ -16,7 +16,7 @@ use std::process::Child;
 /// shell 内建命令清单，作为 `type` 命令查询的单一数据源。
 /// 后续阶段新增内建（如 pwd/cd）时只需在此处追加。
 pub const BUILTINS: &[&str] = &[
-    "echo", "exit", "type", "pwd", "cd", "complete", "jobs", "history",
+    "echo", "exit", "type", "pwd", "cd", "complete", "jobs", "history", "declare",
 ];
 
 /// 后台作业状态。

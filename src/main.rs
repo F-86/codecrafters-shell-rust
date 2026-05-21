@@ -492,6 +492,18 @@ fn main() {
                     eprintln!("shell: write error: {}", e);
                 }
             }
+            // Stage「register the declare builtin」：本阶段仅注册 builtin（BUILTINS
+            // 数组已追加 "declare"），让 `type declare` 命中 "is a shell builtin"
+            // 分支即可。题面 Notes 明确「only need to register」，不实现
+            // `declare variable=value` / `declare -p variable` 等子命令行为。
+            //
+            // 此占位 arm 必须位于 `_ => run_external` 之前，否则用户在 REPL 直接输入
+            // `declare foo=bar` 会落入兜底走 PATH 查找并打印 `declare: command not found`，
+            // 违反「`type` 声称是 builtin、执行也应按 builtin 处理」的契约一致性。
+            //
+            // 后续阶段实现行为时，把空 `{}` 替换为 `run_declare(...)` 调用即可，沿用
+            // `run_complete` / `run_history` 的 `if let Err(e) = ...` IO 错误包裹模板。
+            "declare" => {}
             _ => {
                 run_external(cmd, line, args, &parsed, sink, err_sink, &jobs_table);
             }
